@@ -1,0 +1,151 @@
+{
+  "name": "payload-plugin-gtm",
+  "version": "0.1.0",
+  "description": "Google Tag Manager for Payload CMS v3 with automatic dataLayer event discovery (runtime capture, container scan, page crawl) and an editable event registry.",
+  "keywords": [
+    "payload",
+    "payload-plugin",
+    "google-tag-manager",
+    "gtm",
+    "datalayer",
+    "analytics",
+    "tracking-plan",
+    "payloadcms",
+    "ga4",
+    "tag-manager",
+    "event-tracking"
+  ],
+  "homepage": "https://github.com/mahabub123/payload-plugin-gtm#readme",
+  "bugs": {
+    "url": "https://github.com/mahabub123/payload-plugin-gtm/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mahabub123/payload-plugin-gtm.git"
+  },
+  "license": "MIT",
+  "author": "Md Mahabub Alam",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./client": {
+      "import": "./src/exports/client.ts",
+      "types": "./src/exports/client.ts",
+      "default": "./src/exports/client.ts"
+    },
+    "./browser": {
+      "import": "./src/exports/browser.ts",
+      "types": "./src/exports/browser.ts",
+      "default": "./src/exports/browser.ts"
+    },
+    "./react": {
+      "import": "./src/exports/react.ts",
+      "types": "./src/exports/react.ts",
+      "default": "./src/exports/react.ts"
+    }
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": [
+    "dist",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "pnpm clean && pnpm build:types && pnpm build:swc",
+    "build:swc": "swc ./src -d ./dist --config-file .swcrc --strip-leading-paths",
+    "build:types": "tsc -p tsconfig.build.json",
+    "clean": "rimraf dist *.tsbuildinfo",
+    "dev": "next dev dev",
+    "dev:payload": "cross-env PAYLOAD_CONFIG_PATH=./dev/payload.config.ts payload",
+    "generate:importmap": "pnpm dev:payload generate:importmap",
+    "generate:types": "pnpm dev:payload generate:types",
+    "typecheck": "tsc -p dev/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm clean && pnpm build",
+    "lint": "eslint ./src",
+    "lint:fix": "eslint ./src --fix",
+    "format": "prettier --write \"src/**/*.{ts,tsx}\" \"test/**/*.ts\" \"dev/**/*.{ts,tsx}\"",
+    "test:int": "vitest run"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.2.0",
+    "@payloadcms/db-sqlite": "3.92.1",
+    "@payloadcms/eslint-config": "3.28.0",
+    "@payloadcms/next": "3.92.1",
+    "@payloadcms/richtext-lexical": "3.92.1",
+    "@payloadcms/ui": "3.92.1",
+    "@swc/cli": "0.6.0",
+    "@swc/core": "^1.11.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "cross-env": "^10.1.0",
+    "eslint": "^9.23.0",
+    "eslint-config-next": "16.4.5",
+    "graphql": "^16.8.1",
+    "jsdom": "^26",
+    "next": "16.4.5",
+    "payload": "3.92.1",
+    "prettier": "^3.4.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "rimraf": "^6.0.0",
+    "typescript": "^5.9.0",
+    "vite-tsconfig-paths": "^5.1.4",
+    "vitest": "^3.2.0"
+  },
+  "peerDependencies": {
+    "@payloadcms/ui": "^3.80.0",
+    "payload": "^3.80.0",
+    "react": "^19.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "import": "./dist/index.js",
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./client": {
+        "import": "./dist/exports/client.js",
+        "types": "./dist/exports/client.d.ts",
+        "default": "./dist/exports/client.js"
+      },
+      "./browser": {
+        "import": "./dist/exports/browser.js",
+        "types": "./dist/exports/browser.d.ts",
+        "default": "./dist/exports/browser.js"
+      },
+      "./react": {
+        "import": "./dist/exports/react.js",
+        "types": "./dist/exports/react.d.ts",
+        "default": "./dist/exports/react.js"
+      }
+    },
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "sharp",
+      "esbuild",
+      "@swc/core",
+      "unrs-resolver"
+    ]
+  }
+}

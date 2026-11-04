@@ -1,0 +1,27 @@
+{
+  "extends": "../tsconfig.json",
+  "exclude": [],
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.js",
+    "../src/**/*.ts",
+    "../src/**/*.tsx",
+    "next.config.mjs",
+    ".next/types/**/*.ts"
+  ],
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@payload-config": ["./payload.config.ts"],
+      "payload-plugin-gtm": ["../src/index.ts"],
+      "payload-plugin-gtm/client": ["../src/exports/client.ts"],
+      "payload-plugin-gtm/browser": ["../src/exports/browser.ts"],
+      "payload-plugin-gtm/react": ["../src/exports/react.ts"]
+    },
+    "noEmit": true,
+    "emitDeclarationOnly": false,
+    "composite": false,
+    "incremental": false
+  }
+}
