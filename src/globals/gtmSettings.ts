@@ -1,22 +1,36 @@
-import type { GlobalConfig } from 'payload'
+import type { Field, GlobalConfig } from 'payload'
 
 import type { ResolvedGtmPluginOptions } from '../types.js'
 
+import { isAdminUser } from '../lib/access.js'
 import { invalidateSettingsCache } from '../lib/settings.js'
+import { CONTAINER_ID_RE, MEASUREMENT_ID_RE, normalizeTagId, REGION_RE } from '../shared/ids.js'
 
-export const CONTAINER_ID_RE = /^GTM-[A-Z0-9]{4,12}$/
+export { CONTAINER_ID_RE, MEASUREMENT_ID_RE }
+
+const consentSelect = (name: string, label: string): Field => ({
+  name,
+  type: 'select',
+  defaultValue: 'denied',
+  label,
+  options: [
+    { label: 'Denied', value: 'denied' },
+    { label: 'Granted', value: 'granted' },
+  ],
+})
+
+/** Trim + uppercase pasted IDs before validation (` gtm-abc123 ` → `GTM-ABC123`). */
+const normalizeIdHook = ({ value }: { value?: unknown }) => normalizeTagId(value) ?? null
 
 const validateEnvToken = (value: null | string | undefined) =>
   !value || /^[\w-]{1,100}$/.test(value) ? true : 'Only letters, digits, _ and - are allowed'
-
-const isAuthenticated = ({ req }: { req: { user?: unknown } }) => Boolean(req.user)
 
 export const buildGtmSettingsGlobal = (options: ResolvedGtmPluginOptions): GlobalConfig => {
   const global: GlobalConfig = {
     slug: options.globalSlug,
     access: {
-      read: options.access.read ?? isAuthenticated,
-      update: options.access.updateSettings ?? options.access.update ?? isAuthenticated,
+      read: options.access.read ?? isAdminUser,
+      update: options.access.updateSettings ?? options.access.update ?? isAdminUser,
     },
     admin: { group: options.adminGroup },
     fields: [
@@ -26,7 +40,7 @@ export const buildGtmSettingsGlobal = (options: ResolvedGtmPluginOptions): Globa
           {
             name: 'enabled',
             type: 'checkbox',
-            admin: { description: 'Load GTM on the website.' },
+            admin: { description: 'Load GTM / Google Analytics on the website.' },
             defaultValue: true,
           },
           {
@@ -37,6 +51,7 @@ export const buildGtmSettingsGlobal = (options: ResolvedGtmPluginOptions): Globa
                 ? `Leave empty to use the code default (${options.containerId}).`
                 : 'e.g. GTM-ABC1234',
             },
+            hooks: { beforeValidate: [normalizeIdHook] },
             validate: (value: null | string | undefined) =>
               !value || CONTAINER_ID_RE.test(value) ? true : 'Must look like GTM-XXXXXXX',
           },
@@ -50,6 +65,115 @@ export const buildGtmSettingsGlobal = (options: ResolvedGtmPluginOptions): Globa
                 : 'Must be a valid JS identifier',
           },
         ],
+      },
+      {
+        name: 'analytics',
+        type: 'group',
+        admin: {
+          description:
+            'Google Analytics 4 via gtag.js. Works with or without a GTM container. If your GTM container already fires a GA4 tag for this ID, leave this empty, or page views are counted twice.',
+        },
+        fields: [
+          {
+            type: 'row',
+            fields: [
+              {
+                name: 'measurementId',
+                type: 'text',
+                admin: {
+                  description: options.measurementId
+                    ? `Leave empty to use the code default (${options.measurementId}).`
+                    : 'e.g. G-ABC123XYZ9',
+                },
+                hooks: { beforeValidate: [normalizeIdHook] },
+                label: 'Measurement ID',
+                validate: (value: null | string | undefined) =>
+                  !value || MEASUREMENT_ID_RE.test(value) ? true : 'Must look like G-XXXXXXXXXX',
+              },
+              {
+                name: 'sendPageView',
+                type: 'checkbox',
+                admin: {
+                  description:
+                    'Send the initial page_view. SPA navigations are tracked by GA4 enhanced measurement.',
+                },
+                defaultValue: true,
+              },
+              {
+                name: 'debugMode',
+                type: 'checkbox',
+                admin: { description: 'Show hits in GA4 DebugView. Turn off in production.' },
+                defaultValue: false,
+              },
+            ],
+          },
+        ],
+        label: 'Google Analytics 4',
+      },
+      {
+        name: 'consent',
+        type: 'group',
+        admin: {
+          description:
+            'Google Consent Mode v2. When on, these defaults are sent before GTM / GA4 load, and your consent banner calls updateConsent() when the visitor decides. Required for EEA/UK traffic. Turning this on with "denied" defaults stops GA4 cookies until consent is granted.',
+        },
+        fields: [
+          {
+            name: 'enabled',
+            type: 'checkbox',
+            defaultValue: false,
+            label: 'Send consent defaults',
+          },
+          {
+            type: 'row',
+            admin: { condition: (_, sibling) => Boolean(sibling?.enabled) },
+            fields: [
+              consentSelect('analyticsStorage', 'analytics_storage'),
+              consentSelect('adStorage', 'ad_storage'),
+              consentSelect('adUserData', 'ad_user_data'),
+              consentSelect('adPersonalization', 'ad_personalization'),
+            ],
+          },
+          {
+            type: 'row',
+            admin: { condition: (_, sibling) => Boolean(sibling?.enabled) },
+            fields: [
+              {
+                name: 'waitForUpdateMs',
+                type: 'number',
+                admin: {
+                  description: 'How long tags wait for the banner to send an update (ms).',
+                  step: 100,
+                },
+                defaultValue: 500,
+                max: 10_000,
+                min: 0,
+              },
+              {
+                name: 'regions',
+                type: 'text',
+                admin: {
+                  description:
+                    'Apply these defaults only in these ISO regions (e.g. DE, FR, US-CA). Empty = everywhere.',
+                },
+                hasMany: true,
+                hooks: {
+                  beforeValidate: [
+                    ({ value }) =>
+                      Array.isArray(value)
+                        ? value.map((r) => (typeof r === 'string' ? r.trim().toUpperCase() : r))
+                        : value,
+                  ],
+                },
+                validate: (value: null | string[] | undefined) =>
+                  !value || value.every((r) => REGION_RE.test(r))
+                    ? true
+                    : 'Use ISO codes like DE or US-CA',
+              },
+            ],
+          },
+        ],
+        label: 'Consent Mode',
       },
       {
         name: 'environment',

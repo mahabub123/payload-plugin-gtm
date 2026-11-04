@@ -1,6 +1,12 @@
 import type { Payload } from 'payload'
 
+import type { ConsentState } from '../browser/index.js'
 import type { GtmRuntimeSettings, ResolvedGtmPluginOptions } from '../types.js'
+
+import { CONTAINER_ID_RE, MEASUREMENT_ID_RE, REGION_RE, validTagId } from '../shared/ids.js'
+
+/** Anything but an explicit 'granted' is treated as denied (fail closed). */
+const consentState = (value: unknown): ConsentState => (value === 'granted' ? 'granted' : 'denied')
 
 let cache: { expires: number; value: GtmRuntimeSettings } | null = null
 
@@ -10,6 +16,20 @@ export const invalidateSettingsCache = () => {
 }
 
 type SettingsDoc = {
+  analytics?: {
+    debugMode?: boolean | null
+    measurementId?: null | string
+    sendPageView?: boolean | null
+  }
+  consent?: {
+    adPersonalization?: ConsentState | null
+    adStorage?: ConsentState | null
+    adUserData?: ConsentState | null
+    analyticsStorage?: ConsentState | null
+    enabled?: boolean | null
+    regions?: null | string[]
+    waitForUpdateMs?: null | number
+  }
   containerId?: null | string
   crawl?: { siteUrl?: null | string; urls?: null | string[]; useSitemap?: boolean | null }
   dataLayerName?: null | string
@@ -30,8 +50,35 @@ export const resolveSettings = (
 ): GtmRuntimeSettings => {
   const d = doc ?? {}
   const sampleRate = d.discovery?.sampleRate
+  const wait = d.consent?.waitForUpdateMs
   return {
-    containerId: d.containerId || options.containerId || undefined,
+    analytics: {
+      debugMode: d.analytics?.debugMode ?? false,
+      // Re-validated here so a bad ID in the DB is never sent to browsers.
+      measurementId:
+        validTagId(d.analytics?.measurementId, MEASUREMENT_ID_RE) ??
+        validTagId(options.measurementId, MEASUREMENT_ID_RE),
+      sendPageView: d.analytics?.sendPageView ?? true,
+    },
+    consent: {
+      enabled: d.consent?.enabled ?? false,
+      regions: (d.consent?.regions ?? [])
+        .map((r) => r.trim().toUpperCase())
+        .filter((r) => REGION_RE.test(r)),
+      signals: {
+        ad_personalization: consentState(d.consent?.adPersonalization),
+        ad_storage: consentState(d.consent?.adStorage),
+        ad_user_data: consentState(d.consent?.adUserData),
+        analytics_storage: consentState(d.consent?.analyticsStorage),
+      },
+      waitForUpdateMs:
+        typeof wait === 'number' && Number.isInteger(wait) && wait >= 0 && wait <= 10_000
+          ? wait
+          : 500,
+    },
+    containerId:
+      validTagId(d.containerId, CONTAINER_ID_RE) ??
+      validTagId(options.containerId, CONTAINER_ID_RE),
     crawl: {
       siteUrl: d.crawl?.siteUrl || undefined,
       urls: d.crawl?.urls ?? [],

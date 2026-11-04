@@ -109,6 +109,59 @@ describe('GET /gtm/config', () => {
       enabled: true,
     })
     expect(res.headers.get('access-control-allow-origin')).toBe('*')
+    expect(body.analytics).toBeUndefined()
+  })
+
+  test('includes GA4 settings when a measurement ID is set', async () => {
+    await setSettings({ analytics: { debugMode: true, measurementId: 'G-TEST12345' } })
+    try {
+      const body = await (await request('get', '/gtm/config')).json()
+      expect(body.analytics).toEqual({
+        debugMode: true,
+        measurementId: 'G-TEST12345',
+        sendPageView: true,
+      })
+      expect(body.containerId).toBe('GTM-TEST123')
+    } finally {
+      await setSettings({ analytics: { debugMode: false, measurementId: null } })
+    }
+  })
+
+  test('normalizes pasted IDs and exposes consent defaults when enabled', async () => {
+    await setSettings({
+      analytics: { measurementId: ' g-test12345 ' },
+      consent: { adStorage: 'denied', analyticsStorage: 'denied', enabled: true, regions: ['de'] },
+    })
+    try {
+      const saved = (await payload.findGlobal({ slug: 'gtm-settings' as never })) as any
+      expect(saved.analytics.measurementId).toBe('G-TEST12345')
+      const body = await (await request('get', '/gtm/config')).json()
+      expect(body.consent).toEqual({
+        regions: ['DE'],
+        signals: {
+          ad_personalization: 'denied',
+          ad_storage: 'denied',
+          ad_user_data: 'denied',
+          analytics_storage: 'denied',
+        },
+        waitForUpdateMs: 500,
+      })
+    } finally {
+      await setSettings({ analytics: { measurementId: null }, consent: { enabled: false } })
+    }
+    expect((await (await request('get', '/gtm/config')).json()).consent).toBeUndefined()
+  })
+
+  test('GA4 alone enables the runtime', async () => {
+    await setSettings({ analytics: { measurementId: 'G-TEST12345' }, containerId: null })
+    try {
+      const body = await (await request('get', '/gtm/config')).json()
+      expect(body).toMatchObject({ analytics: { measurementId: 'G-TEST12345' }, enabled: true })
+      expect(body.containerId).toBeUndefined()
+      expect(body.discovery.enabled).toBe(true)
+    } finally {
+      await setSettings({ analytics: { measurementId: null }, containerId: 'GTM-TEST123' })
+    }
   })
 })
 
@@ -333,6 +386,60 @@ describe('scan', () => {
     expect(plan).toMatchObject({ sources: ['crawl'] })
     expect(plan!.pages.map((p: any) => p.path)).toEqual(['/pricing'])
     expect(await findEvent('search_submit')).toBeDefined()
+  })
+
+  test('users of non-admin auth collections are refused by default (P1)', async () => {
+    const customer = { id: 1, collection: 'customers' }
+    expect((await request('post', '/gtm/scan', { body: {}, user: customer })).status).toBe(403)
+    expect((await request('get', '/gtm/export', { user: customer })).status).toBe(403)
+    await expect(
+      payload.updateGlobal({
+        slug: 'gtm-settings' as never,
+        data: { containerId: 'GTM-EVIL999' } as never,
+        overrideAccess: false,
+        user: customer as never,
+      }),
+    ).rejects.toThrow()
+    await expect(
+      payload.find({
+        collection: 'gtm-events' as never,
+        overrideAccess: false,
+        user: customer as never,
+      }),
+    ).rejects.toThrow()
+    const admin = { id: 1, collection: 'users' }
+    const ok = await payload.findGlobal({
+      slug: 'gtm-settings' as never,
+      overrideAccess: false,
+      user: admin as never,
+    })
+    expect((ok as any).containerId).toBe('GTM-TEST123')
+  })
+
+  test('collect rejects an oversized chunked body without buffering it (P3)', async () => {
+    const big = new TextEncoder().encode('x'.repeat(16 * 1024))
+    let pulled = 0
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled++
+        if (pulled > 100) {
+          controller.close() // 1.6 MB total if fully read
+        } else {
+          controller.enqueue(big)
+        }
+      },
+    })
+    const req = new Request('http://localhost:3000/api/gtm/collect', {
+      body: stream,
+      // @ts-expect-error Node needs duplex for streaming request bodies
+      duplex: 'half',
+      headers: { 'content-type': 'text/plain', 'x-forwarded-for': '10.9.9.9' },
+      method: 'POST',
+    })
+    const payloadReq = (await createPayloadRequest({ config, request: req })) as PayloadRequest
+    const res = await endpoint('post', '/gtm/collect')(payloadReq)
+    expect(res.status).toBe(413)
+    expect(pulled).toBeLessThan(10)
   })
 
   test('export returns a tracking plan for authenticated users', async () => {

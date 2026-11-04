@@ -3,6 +3,7 @@ import type { Endpoint, PayloadHandler, PayloadRequest } from 'payload'
 import type { Observation } from '../lib/registry.js'
 import type { ResolvedGtmPluginOptions } from '../types.js'
 
+import { isAdminUser } from '../lib/access.js'
 import { buildPublicConfig } from '../lib/publicConfig.js'
 import { createRateLimiter, createTtlSet } from '../lib/rateLimit.js'
 import { upsertObservations, upsertOptionsFrom } from '../lib/registry.js'
@@ -30,6 +31,39 @@ export const defaultClientIp = (req: PayloadRequest): string => {
     .map((s) => s.trim())
     .filter(Boolean)
   return forwarded?.length ? forwarded[forwarded.length - 1] : 'unknown'
+}
+
+/**
+ * Reads the request body, stopping at `maxBytes` (returns null when exceeded). Content-Length
+ * can be absent (chunked uploads) or wrong, so the cap is enforced on the actual stream and
+ * an oversized body is never buffered in full.
+ */
+export const readBodyCapped = async (
+  req: Pick<PayloadRequest, 'body' | 'text'>,
+  maxBytes: number,
+): Promise<null | string> => {
+  const body = req.body
+  if (!body || typeof body.getReader !== 'function') {
+    const text = (await req.text?.()) ?? ''
+    return new TextEncoder().encode(text).byteLength > maxBytes ? null : text
+  }
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let received = 0
+  let out = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) {
+      break
+    }
+    received += value.byteLength
+    if (received > maxBytes) {
+      await reader.cancel().catch(() => {})
+      return null
+    }
+    out += decoder.decode(value, { stream: true })
+  }
+  return out + decoder.decode()
 }
 
 const serverOrigin = (req: PayloadRequest): null | string => {
@@ -77,7 +111,7 @@ export const buildEndpoints = (options: ResolvedGtmPluginOptions): Endpoint[] =>
   const clientIp = options.discovery.getClientIp ?? defaultClientIp
   const rateLimiter = options.discovery.rateLimiter
   const recent = createTtlSet(options.discovery.dedupeWindowMs)
-  const canScan = options.access.scan ?? (({ req }) => Boolean(req.user))
+  const canScan = options.access.scan ?? isAdminUser
 
   const corsFor = (req: PayloadRequest): Record<string, string> => {
     const origin = req.headers?.get('origin')
@@ -137,8 +171,8 @@ export const buildEndpoints = (options: ResolvedGtmPluginOptions): Endpoint[] =>
 
     let raw: unknown
     try {
-      const text = (await req.text?.()) ?? ''
-      if (text.length > LIMITS.maxBodyBytes) {
+      const text = await readBodyCapped(req, LIMITS.maxBodyBytes)
+      if (text === null) {
         return json({ error: 'Payload too large' }, 413, cors)
       }
       raw = JSON.parse(text)
@@ -257,6 +291,7 @@ export const buildEndpoints = (options: ResolvedGtmPluginOptions): Endpoint[] =>
         containerId: settings.containerId,
         events,
         generatedAt: new Date().toISOString(),
+        measurementId: settings.analytics.measurementId,
         version: 1,
       },
       200,

@@ -14,7 +14,8 @@ export type GoogleTagManagerProps = {
 } & Omit<InitGtmOptions, 'config'>
 
 /**
- * Drop-in GTM loader with automatic dataLayer discovery.
+ * Drop-in GTM and/or GA4 (gtag.js) loader with automatic dataLayer discovery.
+ * Loads whichever of the container ID / measurement ID is configured in Payload.
  *
  * @example
  * // app/layout.tsx
@@ -24,7 +25,17 @@ export type GoogleTagManagerProps = {
  * </body>
  */
 export const GoogleTagManager = ({ config, ...options }: GoogleTagManagerProps) => {
-  const { configUrl, discovery, loadContainer, nonce, serverUrl } = options
+  const {
+    apiRoute,
+    basePath,
+    configUrl,
+    consentDefaults,
+    discovery,
+    loadAnalytics,
+    loadContainer,
+    nonce,
+    serverUrl,
+  } = options
 
   useEffect(() => {
     let stop: (() => void) | undefined
@@ -42,7 +53,19 @@ export const GoogleTagManager = ({ config, ...options }: GoogleTagManagerProps) 
     }
     // Re-init only when identity-relevant inputs change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config?.containerId, configUrl, discovery, loadContainer, nonce, serverUrl])
+  }, [
+    config?.containerId,
+    config?.analytics?.measurementId,
+    apiRoute,
+    basePath,
+    configUrl,
+    consentDefaults,
+    discovery,
+    loadAnalytics,
+    loadContainer,
+    nonce,
+    serverUrl,
+  ])
 
   if (!config?.enabled || !config.containerId || loadContainer === false) {
     return null

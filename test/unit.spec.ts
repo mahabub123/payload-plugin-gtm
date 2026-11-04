@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'vitest'
 
-import { gtmNoscriptUrl, gtmScriptContent } from '../src/browser/index.js'
+import {
+  consentScriptContent,
+  gtagScriptContent,
+  gtmNoscriptUrl,
+  gtmScriptContent,
+} from '../src/browser/index.js'
+import { resolveOptions } from '../src/index.js'
+import { resolveSettings } from '../src/lib/settings.js'
 import { isOriginAllowed } from '../src/endpoints/index.js'
 import { expandSimpleRegex, parseContainer } from '../src/lib/containerParser.js'
 import {
@@ -380,5 +387,113 @@ describe('snippet', () => {
     expect(gtmNoscriptUrl({ containerId: 'GTM-ABC1234' })).toBe(
       'https://www.googletagmanager.com/ns.html?id=GTM-ABC1234',
     )
+  })
+})
+
+describe('google analytics', () => {
+  test('renders the gtag.js snippet and validates inputs (no injection)', () => {
+    const js = gtagScriptContent({ measurementId: 'G-ABC123XYZ9' })
+    expect(js).toContain("'dataLayer','G-ABC123XYZ9'")
+    expect(js).toContain("'/gtag/js?id='")
+    expect(js).toContain("g('config',i,{})")
+    expect(js).not.toContain('debug_mode')
+    const custom = gtagScriptContent({
+      dataLayerName: 'myLayer',
+      debugMode: true,
+      measurementId: 'G-ABC123XYZ9',
+      sendPageView: false,
+    })
+    expect(custom).toContain('{"send_page_view":false,"debug_mode":true}')
+    expect(custom).toContain("'myLayer','G-ABC123XYZ9'")
+    expect(() => gtagScriptContent({ measurementId: "G-1');alert(1)//" })).toThrow()
+    expect(() => gtagScriptContent({ measurementId: 'UA-12345-1' })).toThrow()
+    expect(() =>
+      gtagScriptContent({ dataLayerName: 'a;b', measurementId: 'G-ABC123XYZ9' }),
+    ).toThrow()
+  })
+
+  test('settings: global value wins over the code default', () => {
+    const options = resolveOptions({ measurementId: 'G-DEFAULT1' })
+    expect(resolveSettings({}, options).analytics).toEqual({
+      debugMode: false,
+      measurementId: 'G-DEFAULT1',
+      sendPageView: true,
+    })
+    expect(
+      resolveSettings({ analytics: { measurementId: 'G-SAVED123', sendPageView: false } }, options)
+        .analytics,
+    ).toEqual({ debugMode: false, measurementId: 'G-SAVED123', sendPageView: false })
+  })
+})
+
+describe('review fixes', () => {
+  test('G2: nonce reaches the dynamically loaded gtm.js / gtag.js script', () => {
+    const nonce = 'abc123XYZ+/='
+    expect(gtmScriptContent({ containerId: 'GTM-ABC1234', nonce })).toContain(
+      `j.setAttribute('nonce',"${nonce}")`,
+    )
+    expect(gtagScriptContent({ measurementId: 'G-ABC123XYZ9', nonce })).toContain(
+      `j.setAttribute('nonce',"${nonce}")`,
+    )
+    expect(gtmScriptContent({ containerId: 'GTM-ABC1234' })).not.toContain('nonce')
+    expect(() =>
+      gtagScriptContent({ measurementId: 'G-ABC123XYZ9', nonce: `x");alert(1)//` }),
+    ).toThrow(/nonce/)
+  })
+
+  test('G1: consent default snippet is validated', () => {
+    const js = consentScriptContent({
+      regions: ['DE', 'US-CA'],
+      signals: { ad_storage: 'denied', analytics_storage: 'denied' },
+      waitForUpdateMs: 500,
+    })
+    expect(js).toContain(
+      `('consent','default',{"ad_storage":"denied","analytics_storage":"denied","wait_for_update":500,"region":["DE","US-CA"]})`,
+    )
+    expect(() => consentScriptContent({ signals: { analytics_storage: 'yes' as never } })).toThrow()
+    expect(() => consentScriptContent({ signals: {} })).toThrow()
+    expect(() =>
+      consentScriptContent({ regions: ['de");x("'], signals: { ad_storage: 'denied' } }),
+    ).toThrow(/region/)
+    expect(() =>
+      consentScriptContent({ signals: { ad_storage: 'denied' }, waitForUpdateMs: 1e9 }),
+    ).toThrow()
+  })
+
+  test('G1: consent settings fail closed and drop bad regions', () => {
+    const c = resolveSettings(
+      {
+        consent: {
+          adStorage: 'granted',
+          analyticsStorage: 'weird' as never,
+          enabled: true,
+          regions: ['de', 'bad region'],
+        },
+      },
+      resolveOptions(),
+    ).consent
+    expect(c).toEqual({
+      enabled: true,
+      regions: ['DE'],
+      signals: {
+        ad_personalization: 'denied',
+        ad_storage: 'granted',
+        ad_user_data: 'denied',
+        analytics_storage: 'denied',
+      },
+      waitForUpdateMs: 500,
+    })
+  })
+
+  test('G3: bad code defaults fail at boot; bad stored IDs are never served', () => {
+    expect(() => resolveOptions({ measurementId: 'UA-12345-1' })).toThrow(/measurementId/)
+    expect(() => resolveOptions({ containerId: 'GTM-' })).toThrow(/containerId/)
+    expect(resolveOptions({ measurementId: ' g-abc12345 ' }).measurementId).toBe('G-ABC12345')
+    const s = resolveSettings(
+      { analytics: { measurementId: 'UA-1-1' }, containerId: 'nope' },
+      resolveOptions({ measurementId: 'G-DEFAULT1' }),
+    )
+    expect(s.analytics.measurementId).toBe('G-DEFAULT1')
+    expect(s.containerId).toBeUndefined()
   })
 })

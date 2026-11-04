@@ -2,7 +2,7 @@
 
 Google Tag Manager for **Payload CMS v3**, with **automatic dataLayer event discovery**.
 
-The plugin installs GTM on your site and finds every event your site emits. Those events go into an editable **event registry** in the Payload admin, which works as a living tracking plan.
+The plugin installs GTM and/or **Google Analytics 4** (gtag.js) on your site and finds every event your site emits. Those events go into an editable **event registry** in the Payload admin, which works as a living tracking plan.
 
 Events are discovered from three sources, because none of them is complete on its own:
 
@@ -33,6 +33,7 @@ export default buildConfig({
   plugins: [
     gtmPlugin({
       containerId: 'GTM-ABC1234', // optional default; editable in the admin
+      measurementId: 'G-ABC123XYZ9', // optional GA4 via gtag.js; editable in the admin
       scanSchedule: '0 3 * * *', // optional: daily container scan via Payload jobs
     }),
   ],
@@ -90,7 +91,40 @@ initGtm({ serverUrl: 'https://cms.example.com' })
 
 The browser runtime is about 3.2 KB min+gzip. It never throws into your page, and it sends with `fetch(keepalive)` or `sendBeacon` on page hide.
 
-Lower-level APIs: `loadGtm()`, `startDiscovery()`, `gtmScriptContent()` (for SSR `<script>` tags), `gtmNoscriptUrl()`, and `pushEvent()`.
+Lower-level APIs: `loadGtm()`, `loadGoogleAnalytics()`, `startDiscovery()`, `gtmScriptContent()` / `gtagScriptContent()` (for SSR `<script>` tags), `consentScriptContent()`, `gtmNoscriptUrl()`, `pushEvent()`, `gtagEvent()`, `applyConsentDefaults()`, and `updateConsent()`.
+
+### Google Analytics 4
+
+Set a GA4 measurement ID (`G-…`) in **GTM Settings → Google Analytics 4** or with the `measurementId` option. The same `<GoogleTagManager />` / `initGtm()` call then loads gtag.js too. You can use GA4 on its own, without a GTM container.
+
+- GA4 and GTM share one `dataLayer`, so discovery records `gtag('event', …)` calls in the event registry.
+- Send events with `gtagEvent('sign_up', { method: 'email' })`. `pushEvent()` writes a plain `{ event }` object that only GTM reads; gtag.js ignores it.
+- SPA route changes are tracked by GA4 enhanced measurement ("page changes based on browser history events"), which is on by default in GA4.
+- If your GTM container already fires a GA4 tag for the same ID, leave the measurement ID empty here, or every page view is counted twice.
+- Pass `loadAnalytics={false}` (or `loadAnalytics: false`) when you render `gtagScriptContent()` yourself.
+- Container scans read GTM containers only. On a GA4-only site, runtime and crawl discovery still work.
+- IDs pasted with spaces or in lowercase are cleaned up on save. A mistyped `containerId` / `measurementId` plugin option fails at boot instead of silently loading nothing.
+
+### Consent Mode v2 (EEA / UK)
+
+GA4 sets cookies as soon as it loads. To wait for the visitor's choice, turn on **GTM Settings → Consent Mode**. The plugin then pushes `gtag('consent', 'default', …)` before GTM or GA4 load. The defaults are `denied` for `analytics_storage`, `ad_storage`, `ad_user_data` and `ad_personalization`, optionally limited to regions such as `DE` or `US-CA`, with a `wait_for_update` of 500 ms. Your banner then reports the decision:
+
+```ts
+import { updateConsent } from 'payload-plugin-gtm/browser' // or /react
+
+onAccept(() => updateConsent({ analytics_storage: 'granted', ad_storage: 'granted' }))
+```
+
+- If your CMP (Cookiebot, OneTrust, …) sets its own defaults, pass `consentDefaults={false}` so the plugin doesn't override them.
+- For the earliest possible defaults, render `consentScriptContent(config.consent)` in an inline `<script>` in `<head>`, before any tag, and pass `consentDefaults={false}`.
+- Discovery beacons carry no cookies or identifiers. Gate them separately with `shouldCapture` if your policy requires it.
+
+### Content Security Policy
+
+Pass your nonce as `nonce`. It is set on the inline bootstrap **and** on the `gtm.js` / `gtag/js` script that the bootstrap loads. GA4 also needs these hosts:
+
+- `script-src`: `https://www.googletagmanager.com`
+- `connect-src` / `img-src`: `https://*.google-analytics.com`, `https://*.analytics.google.com`, `https://www.googletagmanager.com`
 
 ---
 
@@ -101,7 +135,7 @@ Everything appears under **Google Tag Manager** in the admin sidebar:
 - **Data Layer Events.** The registry. Discovery fills the read-only fields: parameters, sources, pages, fired tags, occurrences, and first/last seen. **You** own `status` (discovered → approved / deprecated / ignored), `description`, `owner`, `notes`, and per-parameter descriptions. Discovery never overwrites these.
   - Above the list there is a panel with **Scan GTM container**, **Scan + crawl site**, and **Export tracking plan** (JSON). It also shows the last-scan summary and the Data Layer Variables the container reads.
   - Marking an event **ignored** stops browsers from reporting it.
-- **GTM Settings.** Holds the container ID, GTM environment (`gtm_auth` / `gtm_preview`), dataLayer name, discovery settings (enable, sample rate, built-in `gtm.*` events, example capture, allowed origins), and crawl settings (site URL, sitemap, extra URLs).
+- **GTM Settings.** Holds the container ID, the GA4 measurement ID (with initial page view and DebugView toggles), Consent Mode v2 defaults, GTM environment (`gtm_auth` / `gtm_preview`), dataLayer name, discovery settings (enable, sample rate, built-in `gtm.*` events, example capture, allowed origins), and crawl settings (site URL, sitemap, extra URLs).
 
 ## REST endpoints
 
@@ -119,6 +153,7 @@ The job task `gtmScan` (input `{ crawl?: boolean }`) is registered for scheduled
 ```ts
 gtmPlugin({
   containerId?: string             // default container (the settings global overrides it)
+  measurementId?: string           // default GA4 measurement ID, loaded with gtag.js (global overrides it)
   disabled?: boolean               // keeps the schema, removes endpoints, UI and job
   collectionSlug?: string          // 'gtm-events'
   globalSlug?: string              // 'gtm-settings'
@@ -145,8 +180,15 @@ gtmPlugin({
 
 ## Security notes
 
+- **Who can change the settings matters most.** Anyone who can edit **GTM Settings** can load any GTM container, which means running any JavaScript on every page of your site. By default only logged-in users of the **admin user collection** (`admin.user`) can read or edit the plugin's data and run scans. Users of other auth collections, such as storefront customers, are refused. If your admin collection also holds non-admin users (a `roles` field with `customer`, `editor`, …), restrict it explicitly; the plugin logs a warning at boot when it sees a role field and no override:
+
+  ```ts
+  const isAdmin = ({ req }) => Boolean(req.user?.roles?.includes('admin'))
+  gtmPlugin({ access: { updateSettings: isAdmin, scan: isAdmin, update: isAdmin, delete: isAdmin } })
+  ```
+
 - **Collect endpoint protections:**
-  - 32 KB body cap, 50 events per batch, 100 parameters per event
+  - 32 KB body cap, enforced on the stream (chunked uploads are cut off, never buffered in full), 50 events per batch, 100 parameters per event
   - strict name/path patterns (so markup can never reach the admin)
   - per-IP token bucket
   - origin allow-list (falls back to the Payload `serverURL` origin)
@@ -154,6 +196,7 @@ gtmPlugin({
   - server-side re-validation and re-redaction of everything the browser sends
 - **REST `create` on the events collection is always denied.** Events are created only by discovery.
 - **Restricted outbound fetches.** Container scans only fetch from `https://www.googletagmanager.com`. The crawl only fetches the configured site's origin; redirects are re-checked, and every fetch has timeouts and byte caps.
+- **The crawler can reach any host the admin enters**, including internal addresses. It stays on that one origin, but only trusted admins should be able to set the site URL (see above).
 - **Client IP.** The default uses `cf-connecting-ip`, then `x-real-ip`, then the *last* `x-forwarded-for` entry (the one your proxy added; the first is client-controlled). Override `discovery.getClientIp` if your setup differs.
 
 ## Running on several instances or serverless
@@ -191,9 +234,26 @@ If the shared limiter throws, the plugin falls back to the in-memory one instead
 - **No runtime events arrive.**
   - Check that `GET /api/gtm/config` returns `discovery.enabled: true`.
   - Check that the site's origin is in **Allowed origins** when the site and CMS live on different origins.
-  - Check that an adblocker isn't blocking `/api/gtm/*`; if it is, change `basePath`.
+  - Check that an adblocker isn't blocking `/api/gtm/*`. If it is, change `basePath`, **and pass the same value to the frontend** (`<GoogleTagManager basePath="t" />` or `initGtm({ basePath: 't' })`). Do the same with `apiRoute` if you changed Payload's `routes.api`. Otherwise the site can't find its config and loads neither GTM nor GA4.
+- **A settings change doesn't show on the site yet.** Each visitor's browser caches the config for 5 minutes, and `/config` is cacheable for 60 s (plus up to 5 min stale-while-revalidate). Allow about 10 minutes, or render the config on the server with `getGtmPublicConfig()`.
+- **"Scan + crawl" times out on serverless.** A crawl can take up to about a minute (25 pages, 10 s timeout each). On platforms with short request limits, run it as the `gtmScan` job (`scanSchedule`, or queue it with `{ crawl: true }`), or lower `crawl.maxPages` / `crawl.timeoutMs`.
 - **Scan says "not found or not published".** The container ID is wrong, or the container has never been published. For an environment, set `gtm_auth`/`gtm_preview`.
 - **Regex trigger "could not be expanded".** Open-ended regexes (such as `.*_error`) can't be turned into a finite list of names. Runtime discovery will still record the actual events.
+
+## Go-live checklist
+
+The test suite covers the plugin's logic. These depend on your site and can only be checked there, on staging first:
+
+- [ ] `access` is restricted to admins if your admin user collection has non-admin roles (watch for the boot warning).
+- [ ] Migration created and applied (`payload migrate:create` / `migrate`) for the new settings fields.
+- [ ] `GET /api/<basePath>/config` returns your IDs, and the frontend uses the same `basePath` / `apiRoute`.
+- [ ] GTM Preview (Tag Assistant) connects, and GA4 **DebugView** shows hits (turn on *debug mode* temporarily, then off).
+- [ ] With Consent Mode on, Tag Assistant shows the consent defaults *before* the first tag fires, and `_ga` cookies only appear after `updateConsent(... 'granted')`.
+- [ ] No double page views: a GA4 tag inside the GTM container and the measurement ID here must not both be used for one property.
+- [ ] Your CSP allows the Google hosts listed above, and the browser console shows no CSP violations.
+- [ ] Allowed origins are set when the site and CMS are on different origins; `POST /collect` from the site returns 202.
+- [ ] Run **Scan GTM container** once against the live container and review the events it finds.
+- [ ] On multi-instance or serverless hosting, a shared `discovery.rateLimiter` is configured if you need a global limit.
 
 ## Development
 

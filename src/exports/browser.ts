@@ -1,15 +1,25 @@
 export {
+  applyConsentDefaults,
+  consentScriptContent,
+  gtagEvent,
+  gtagScriptContent,
   gtmNoscriptUrl,
   gtmScriptContent,
   initGtm,
+  loadGoogleAnalytics,
   loadGtm,
   pushEvent,
   startDiscovery,
+  updateConsent,
 } from '../browser/index.js'
 export type {
+  ConsentDefaults,
+  ConsentSignals,
+  ConsentState,
   DiscoveryOptions,
   GtmEnvironment,
   InitGtmOptions,
+  LoadGoogleAnalyticsOptions,
   LoadGtmOptions,
   PublicGtmConfig,
 } from '../browser/index.js'

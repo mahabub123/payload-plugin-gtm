@@ -1,5 +1,7 @@
 import type { Access, CollectionConfig, GlobalConfig, PayloadRequest } from 'payload'
 
+import type { ConsentSignals } from './browser/index.js'
+
 export type GtmAccessFn = (args: { req: PayloadRequest }) => boolean | Promise<boolean>
 
 /** Pluggable rate limiter for `POST /api/gtm/collect`. */
@@ -9,9 +11,15 @@ export type GtmRateLimiter = {
 
 export type GtmPluginOptions = {
   /**
-   * Access control overrides. Defaults: any authenticated user can read, update,
-   * delete and scan; REST `create` on the events collection is always denied
+   * Access control overrides. Defaults: a logged-in user of the ADMIN user collection
+   * (`config.admin.user`) can read, update, delete and scan; users of other auth
+   * collections are refused. REST `create` on the events collection is always denied
    * (events are created by discovery only).
+   *
+   * SECURITY: whoever can update the settings global can load any GTM container — i.e.
+   * run arbitrary JavaScript on your site. If your admin collection also holds
+   * non-admin users (e.g. a `roles` field with `customer`), set `updateSettings`.
+   * @example access: { updateSettings: ({ req }) => req.user?.roles?.includes('admin') }
    */
   access?: {
     delete?: Access
@@ -108,6 +116,14 @@ export type GtmPluginOptions = {
   /** Slug of the settings global. @default 'gtm-settings' */
   globalSlug?: string
 
+  /**
+   * Default Google Analytics 4 measurement ID (e.g. `G-ABC123XYZ9`), loaded directly with
+   * gtag.js. The value saved in the settings global takes precedence. Works alongside a
+   * GTM container or on its own. Do not also fire a GA4 tag for the same ID from inside
+   * the GTM container, or page views will be counted twice.
+   */
+  measurementId?: string
+
   /** Customize the generated collection (add fields, hooks, tenant scoping...). */
   overrideCollection?: (collection: CollectionConfig) => CollectionConfig
 
@@ -146,6 +162,7 @@ export type ResolvedGtmPluginOptions = {
   globalSlug: string
   /** Internal lease collection, `${collectionSlug}-locks`. */
   lockSlug: string
+  measurementId?: string
   overrideCollection?: GtmPluginOptions['overrideCollection']
   overrideGlobal?: GtmPluginOptions['overrideGlobal']
   scanQueue: string
@@ -154,6 +171,21 @@ export type ResolvedGtmPluginOptions = {
 
 /** Runtime settings: plugin defaults merged with the settings global. */
 export type GtmRuntimeSettings = {
+  analytics: {
+    /** Send GA4 `debug_mode: true` (events show up in GA4 DebugView). */
+    debugMode: boolean
+    measurementId?: string
+    /** Let `gtag('config')` send the initial page_view. */
+    sendPageView: boolean
+  }
+  /** Google Consent Mode v2 defaults pushed before any Google tag loads. */
+  consent: {
+    enabled: boolean
+    /** ISO region codes; empty = everywhere. */
+    regions: string[]
+    signals: Required<ConsentSignals>
+    waitForUpdateMs: number
+  }
   containerId?: string
   crawl: {
     siteUrl?: string

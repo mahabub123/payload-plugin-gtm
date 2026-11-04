@@ -2,13 +2,16 @@
  * Framework-agnostic browser runtime for payload-plugin-gtm.
  *
  *  - `loadGtm()`        injects the standard GTM snippet (idempotent)
+ *  - `loadGoogleAnalytics()` injects the GA4 gtag.js snippet (idempotent)
+ *  - `applyConsentDefaults()` / `updateConsent()` drive Google Consent Mode v2
  *  - `startDiscovery()` captures every dataLayer / gtag event and reports its schema
- *  - `initGtm()`        fetches config from Payload and does both
+ *  - `initGtm()`        fetches config from Payload and does all of the above
  *
  * Everything is wrapped in try/catch: discovery must never break the host site (NFR-03).
  */
 import type { CollectPayload, ObservedEvent } from '../shared/normalize.js'
 
+import { CONTAINER_ID_RE, MEASUREMENT_ID_RE, REGION_RE } from '../shared/ids.js'
 import { BUILT_IN_EVENT_RE, entryToEvent, eventSignature, LIMITS } from '../shared/normalize.js'
 
 export type GtmEnvironment = { auth: string; preview: string }
@@ -17,7 +20,7 @@ export type LoadGtmOptions = {
   containerId: string
   dataLayerName?: string
   environment?: GtmEnvironment
-  /** CSP nonce for the injected script tag. */
+  /** CSP nonce for the injected inline script AND the gtm.js script it loads. */
   nonce?: string
   /** Override the GTM host (e.g. a first-party server-side GTM domain). */
   scriptOrigin?: string
@@ -43,7 +46,45 @@ export type DiscoveryOptions = {
   shouldCapture?: () => boolean
 }
 
+export type LoadGoogleAnalyticsOptions = {
+  dataLayerName?: string
+  /** Send `debug_mode: true` so hits show up in GA4 DebugView. @default false */
+  debugMode?: boolean
+  measurementId: string
+  /** CSP nonce for the injected inline script AND the gtag.js script it loads. */
+  nonce?: string
+  /** Override the gtag.js host (e.g. a first-party server-side tagging domain). */
+  scriptOrigin?: string
+  /** Send the initial page_view from `gtag('config')`. @default true */
+  sendPageView?: boolean
+}
+
+export type ConsentState = 'denied' | 'granted'
+
+/** Google Consent Mode v2 signals. */
+export type ConsentSignals = {
+  ad_personalization?: ConsentState
+  ad_storage?: ConsentState
+  ad_user_data?: ConsentState
+  analytics_storage?: ConsentState
+}
+
+export type ConsentDefaults = {
+  /** ISO 3166-1/2 codes (`DE`, `US-CA`) the defaults apply to. Empty = everywhere. */
+  regions?: string[]
+  signals: ConsentSignals
+  /** How long tags wait for a CMP `update` before firing, ms. @default 0 */
+  waitForUpdateMs?: number
+}
+
 export type PublicGtmConfig = {
+  analytics?: {
+    debugMode?: boolean
+    measurementId: string
+    sendPageView?: boolean
+  }
+  /** Consent Mode v2 defaults, sent before any Google tag loads. */
+  consent?: ConsentDefaults
   containerId?: string
   dataLayerName?: string
   discovery?: {
@@ -62,19 +103,146 @@ type AnyWindow = Record<string, unknown> & Window
 const w = (): AnyWindow | null =>
   typeof window === 'undefined' ? null : (window as unknown as AnyWindow)
 
-const CONTAINER_RE = /^GTM-[A-Z0-9]{4,12}$/
 const IDENT_RE = /^[A-Z_$][\w$]{0,49}$/i
 /** gtm_auth / gtm_preview values (base64url-ish tokens, `env-N`). */
 const ENV_RE = /^[\w-]{1,100}$/
+/** CSP nonces are base64 / base64url tokens. */
+const NONCE_RE = /^[\w+/=-]{8,256}$/
+const CONSENT_KEYS = [
+  'ad_personalization',
+  'ad_storage',
+  'ad_user_data',
+  'analytics_storage',
+] as const
+
+/** Statement that propagates a validated nonce to the dynamically created script `j`. */
+const nonceStatement = (nonce: string | undefined): string => {
+  if (!nonce) {
+    return ''
+  }
+  if (!NONCE_RE.test(nonce)) {
+    throw new Error('Invalid CSP nonce')
+  }
+  return `j.setAttribute('nonce',${JSON.stringify(nonce)});`
+}
+
+/** Pushes a real `arguments` object (gtag.js and GTM ignore plain arrays). */
+const pushArgs = (dataLayerName: string, ...args: unknown[]): void => {
+  const win = w()
+  if (!win) {
+    return
+  }
+  const dl = (win[dataLayerName] = (win[dataLayerName] as undefined | unknown[]) ?? [])
+  ;(function (..._args: unknown[]) {
+    // eslint-disable-next-line prefer-rest-params
+    dl.push(arguments)
+  })(...args)
+}
+
+const validSignals = (signals: ConsentSignals): Record<string, ConsentState> => {
+  const out: Record<string, ConsentState> = {}
+  for (const key of CONSENT_KEYS) {
+    const value = signals?.[key]
+    if (value === undefined) {
+      continue
+    }
+    if (value !== 'denied' && value !== 'granted') {
+      throw new Error(`Invalid consent value for ${key}`)
+    }
+    out[key] = value
+  }
+  if (!Object.keys(out).length) {
+    throw new Error('Consent needs at least one signal')
+  }
+  return out
+}
+
+/** Validated `gtag('consent', 'default', …)` parameters. */
+const consentDefaultParams = (consent: ConsentDefaults): Record<string, unknown> => {
+  const params: Record<string, unknown> = validSignals(consent.signals)
+  const wait = consent.waitForUpdateMs
+  if (wait !== undefined && wait !== 0) {
+    if (!Number.isInteger(wait) || wait < 0 || wait > 10_000) {
+      throw new Error('waitForUpdateMs must be an integer between 0 and 10000')
+    }
+    params.wait_for_update = wait
+  }
+  if (consent.regions?.length) {
+    if (!consent.regions.every((r) => REGION_RE.test(r))) {
+      throw new Error('Invalid consent region (use ISO codes like DE or US-CA)')
+    }
+    params.region = consent.regions
+  }
+  return params
+}
+
+/**
+ * Inline Consent Mode v2 default command (for SSR `<script>` tags). Render it BEFORE the
+ * GTM / gtag snippets. Values are validated to prevent injection.
+ */
+export const consentScriptContent = (
+  consent: ConsentDefaults,
+  dataLayerName = 'dataLayer',
+): string => {
+  if (!IDENT_RE.test(dataLayerName)) {
+    throw new Error('Invalid dataLayer name')
+  }
+  const params = JSON.stringify(consentDefaultParams(consent))
+  return `(function(w,l){w[l]=w[l]||[];(function(){w[l].push(arguments)})('consent','default',${params});})(window,'${dataLayerName}');`
+}
+
+/**
+ * Pushes the Consent Mode v2 defaults once per page. Must run before GTM / gtag.js load
+ * (`initGtm` does this for you). Returns false when already applied or invalid.
+ */
+export const applyConsentDefaults = (
+  consent: ConsentDefaults,
+  dataLayerName = 'dataLayer',
+): boolean => {
+  const win = w()
+  if (!win || win.__payload_consent_default) {
+    return false
+  }
+  try {
+    pushArgs(dataLayerName, 'consent', 'default', consentDefaultParams(consent))
+    win.__payload_consent_default = true
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Call from your consent banner / CMP callback when the visitor decides, e.g.
+ * `updateConsent({ analytics_storage: 'granted' })`.
+ */
+export const updateConsent = (signals: ConsentSignals, dataLayerName = 'dataLayer'): void => {
+  const win = w()
+  if (!win) {
+    return
+  }
+  try {
+    const params = validSignals(signals)
+    const gtag = win.gtag
+    if (typeof gtag === 'function') {
+      ;(gtag as (...args: unknown[]) => void)('consent', 'update', params)
+    } else {
+      pushArgs(dataLayerName, 'consent', 'update', params)
+    }
+  } catch {
+    // never throw into the host page
+  }
+}
 
 /** Inline GTM bootstrap (for SSR `<script>` tags). Values are validated to prevent injection. */
 export const gtmScriptContent = ({
   containerId,
   dataLayerName = 'dataLayer',
   environment,
+  nonce,
   scriptOrigin = 'https://www.googletagmanager.com',
 }: LoadGtmOptions): string => {
-  if (!CONTAINER_RE.test(containerId)) {
+  if (!CONTAINER_ID_RE.test(containerId)) {
     throw new Error('Invalid GTM container ID')
   }
   if (!IDENT_RE.test(dataLayerName)) {
@@ -87,11 +255,50 @@ export const gtmScriptContent = ({
     ? `+'&gtm_auth=${encodeURIComponent(environment.auth)}&gtm_preview=${encodeURIComponent(environment.preview)}&gtm_cookies_win=x'`
     : ''
   const origin = JSON.stringify(scriptOrigin.replace(/\/+$/, ''))
+  const n = nonceStatement(nonce)
   return (
     `(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});` +
     `var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;` +
-    `j.src=${origin}+'/gtm.js?id='+i+dl${env};f.parentNode.insertBefore(j,f);` +
+    `j.src=${origin}+'/gtm.js?id='+i+dl${env};${n}f.parentNode.insertBefore(j,f);` +
     `})(window,document,'script','${dataLayerName}','${containerId}');`
+  )
+}
+
+/**
+ * Inline GA4 bootstrap (for SSR `<script>` tags): defines `gtag()` on the dataLayer,
+ * sends `config` and loads gtag.js. Values are validated to prevent injection.
+ * `window.gtag` is only defined when missing, so an existing gtag keeps working.
+ */
+export const gtagScriptContent = ({
+  dataLayerName = 'dataLayer',
+  debugMode = false,
+  measurementId,
+  nonce,
+  scriptOrigin = 'https://www.googletagmanager.com',
+  sendPageView = true,
+}: LoadGoogleAnalyticsOptions): string => {
+  if (!MEASUREMENT_ID_RE.test(measurementId)) {
+    throw new Error('Invalid GA4 measurement ID')
+  }
+  if (!IDENT_RE.test(dataLayerName)) {
+    throw new Error('Invalid dataLayer name')
+  }
+  // Only booleans go in here; GA4 treats any debug_mode value as "on", so omit it when off.
+  const cfg: Record<string, boolean> = {}
+  if (!sendPageView) {
+    cfg.send_page_view = false
+  }
+  if (debugMode) {
+    cfg.debug_mode = true
+  }
+  const origin = JSON.stringify(scriptOrigin.replace(/\/+$/, ''))
+  const n = nonceStatement(nonce)
+  return (
+    `(function(w,d,s,l,i){w[l]=w[l]||[];var g=function(){w[l].push(arguments)};w.gtag=w.gtag||g;` +
+    `g('js',new Date());g('config',i,${JSON.stringify(cfg)});` +
+    `var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;` +
+    `j.src=${origin}+'/gtag/js?id='+i+dl;${n}f.parentNode.insertBefore(j,f);` +
+    `})(window,document,'script','${dataLayerName}','${measurementId}');`
   )
 }
 
@@ -128,6 +335,31 @@ export const loadGtm = (options: LoadGtmOptions): boolean => {
       script.nonce = options.nonce
     }
     script.setAttribute('data-payload-gtm', options.containerId)
+    ;(document.head || document.documentElement).appendChild(script)
+    win[flag] = true
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Injects GA4 (gtag.js) once per measurement ID. Returns false when already loaded or not in a browser. */
+export const loadGoogleAnalytics = (options: LoadGoogleAnalyticsOptions): boolean => {
+  const win = w()
+  if (!win) {
+    return false
+  }
+  const flag = `__ga_loaded_${options.measurementId}`
+  if (win[flag]) {
+    return false
+  }
+  try {
+    const script = document.createElement('script')
+    script.text = gtagScriptContent(options)
+    if (options.nonce) {
+      script.nonce = options.nonce
+    }
+    script.setAttribute('data-payload-ga', options.measurementId)
     ;(document.head || document.documentElement).appendChild(script)
     win[flag] = true
     return true
@@ -393,12 +625,23 @@ export const startDiscovery = (options: DiscoveryOptions): (() => void) => {
 }
 
 export type InitGtmOptions = {
+  /** Payload `routes.api`, if you changed it. @default '/api' */
+  apiRoute?: string
+  /** The plugin's `basePath` option, if you changed it. @default 'gtm' */
+  basePath?: string
   /** Use this config instead of fetching it (e.g. rendered server-side via `getGtmSettings`). */
   config?: PublicGtmConfig
-  /** Full URL of `GET /api/gtm/config`. Defaults to `${serverUrl}/api/gtm/config`. */
+  /** Full URL of the config endpoint. Defaults to `${serverUrl}${apiRoute}/${basePath}/config`. */
   configUrl?: string
+  /**
+   * Push the Consent Mode defaults from Payload before loading tags. Set false when your
+   * CMP (Cookiebot, OneTrust, …) or an SSR `consentScriptContent()` tag sets them. @default true
+   */
+  consentDefaults?: boolean
   /** Disable runtime discovery even if enabled in Payload. */
   discovery?: boolean
+  /** Skip injecting GA4 gtag.js (e.g. you already render the snippet server-side). */
+  loadAnalytics?: boolean
   /** Skip injecting GTM (e.g. you already render the snippet server-side). */
   loadContainer?: boolean
   nonce?: string
@@ -408,6 +651,17 @@ export type InitGtmOptions = {
 }
 
 const CONFIG_CACHE_KEY = '__payload_gtm_config'
+
+const trimSlashes = (s: string) => s.replace(/^\/+|\/+$/g, '')
+
+/** `${serverUrl}${apiRoute}/${basePath}/config`, honoring a custom API route / basePath. */
+export const defaultConfigUrl = (
+  serverUrl: string,
+  { apiRoute = '/api', basePath = 'gtm' }: Pick<InitGtmOptions, 'apiRoute' | 'basePath'> = {},
+): string => {
+  const api = trimSlashes(apiRoute)
+  return `${serverUrl.replace(/\/+$/, '')}${api ? `/${api}` : ''}/${trimSlashes(basePath)}/config`
+}
 
 const fetchConfig = async (url: string): Promise<PublicGtmConfig> => {
   try {
@@ -451,13 +705,20 @@ export const initGtm = async (options: InitGtmOptions = {}): Promise<() => void>
   try {
     const serverUrl = (options.serverUrl ?? location.origin).replace(/\/+$/, '')
     const config =
-      options.config ?? (await fetchConfig(options.configUrl ?? `${serverUrl}/api/gtm/config`))
-    if (!config.enabled || !config.containerId) {
+      options.config ??
+      (await fetchConfig(options.configUrl ?? defaultConfigUrl(serverUrl, options)))
+    const ga = config.analytics
+    if (!config.enabled || !(config.containerId || ga?.measurementId)) {
       return () => {}
     }
 
     const dataLayerName = config.dataLayerName ?? 'dataLayer'
     let stop = () => {}
+
+    // Consent defaults must reach the dataLayer before any Google tag loads.
+    if (options.consentDefaults !== false && config.consent) {
+      applyConsentDefaults(config.consent, dataLayerName)
+    }
 
     // Start discovery BEFORE loading GTM so gtm.js / early pushes are observed too.
     const d = config.discovery
@@ -474,7 +735,7 @@ export const initGtm = async (options: InitGtmOptions = {}): Promise<() => void>
       })
     }
 
-    if (options.loadContainer !== false) {
+    if (options.loadContainer !== false && config.containerId) {
       loadGtm({
         containerId: config.containerId,
         dataLayerName,
@@ -482,10 +743,41 @@ export const initGtm = async (options: InitGtmOptions = {}): Promise<() => void>
         nonce: options.nonce,
       })
     }
+    if (options.loadAnalytics !== false && ga?.measurementId) {
+      loadGoogleAnalytics({
+        dataLayerName,
+        debugMode: ga.debugMode,
+        measurementId: ga.measurementId,
+        nonce: options.nonce,
+        sendPageView: ga.sendPageView,
+      })
+    }
     return stop
   } catch {
     return () => {}
   }
+}
+
+/**
+ * Sends a GA4 event through `gtag('event', …)`. Use this (not `pushEvent`) when GA4 is
+ * loaded directly: gtag.js ignores plain `{event: …}` objects, which only GTM reads.
+ * Queues on the dataLayer if gtag.js has not loaded yet. Discovery records it either way.
+ */
+export const gtagEvent = (
+  name: string,
+  params: Record<string, unknown> = {},
+  dataLayerName = 'dataLayer',
+): void => {
+  const win = w()
+  if (!win) {
+    return
+  }
+  const gtag = win.gtag
+  if (typeof gtag === 'function') {
+    ;(gtag as (...args: unknown[]) => void)('event', name, params)
+    return
+  }
+  pushArgs(dataLayerName, 'event', name, params)
 }
 
 /** Typed helper to push events to the dataLayer. */

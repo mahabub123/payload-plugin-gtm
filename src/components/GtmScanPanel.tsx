@@ -24,6 +24,7 @@ export const GtmScanPanel: React.FC<Props> = ({ basePath, globalSlug }) => {
   const [busy, setBusy] = useState<'container' | 'crawl' | false>(false)
   const [last, setLast] = useState<null | ScanSummary>(null)
   const [containerId, setContainerId] = useState<null | string>(null)
+  const [measurementId, setMeasurementId] = useState<null | string>(null)
 
   const api = (path: string) =>
     formatAdminURL({ apiRoute: config.routes.api, path: path as `/${string}` })
@@ -34,9 +35,14 @@ export const GtmScanPanel: React.FC<Props> = ({ basePath, globalSlug }) => {
       if (!res.ok) {
         return
       }
-      const doc = (await res.json()) as { containerId?: string; lastScan?: ScanSummary }
+      const doc = (await res.json()) as {
+        analytics?: { measurementId?: string }
+        containerId?: string
+        lastScan?: ScanSummary
+      }
       setLast(doc.lastScan ?? null)
       setContainerId(doc.containerId ?? null)
+      setMeasurementId(doc.analytics?.measurementId ?? null)
     } catch {
       // ignore
     }
@@ -87,7 +93,9 @@ export const GtmScanPanel: React.FC<Props> = ({ basePath, globalSlug }) => {
         }}
       >
         <strong style={{ marginRight: 'auto' }}>
-          Event discovery{containerId ? ` · ${containerId}` : ' · no container configured'}
+          Event discovery
+          {containerId ? ` · ${containerId}` : ' · no container configured'}
+          {measurementId ? ` · GA4 ${measurementId}` : ''}
         </strong>
         <Button
           buttonStyle="secondary"

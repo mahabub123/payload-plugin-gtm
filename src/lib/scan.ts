@@ -87,7 +87,11 @@ const doScan = async (
 
   if (container) {
     if (!settings.containerId) {
-      summary.errors.push('container: no container ID configured')
+      summary.errors.push(
+        settings.analytics.measurementId
+          ? 'container: no GTM container ID configured (GA4 via gtag.js has no container to scan; runtime and crawl discovery still work)'
+          : 'container: no container ID configured',
+      )
     } else {
       try {
         const { status, text } = await safeFetchText(

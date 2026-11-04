@@ -7,7 +7,7 @@
 
 ## 1. Executive Summary
 
-`payload-plugin-gtm` is a Payload CMS v3 plugin that (a) manages a Google Tag Manager (GTM) installation from the Payload admin and (b) **automatically discovers every dataLayer event a website emits** and keeps them in an editable *event registry* (a living tracking plan).
+`payload-plugin-gtm` is a Payload CMS v3 plugin that (a) manages a Google Tag Manager (GTM) and/or Google Analytics 4 (gtag.js) installation, with Google Consent Mode v2 defaults, from the Payload admin and (b) **automatically discovers every dataLayer event a website emits** and keeps them in an editable *event registry* (a living tracking plan).
 
 Discovery combines three independent sources, because none is complete on its own:
 
@@ -24,7 +24,9 @@ The recommended shape is a **single Payload plugin running inside the host Paylo
 - Payload v3 plugins are functions of the form `(options) => (config) => config`. They must spread existing arrays and chain `onInit`. Admin components are referenced by import-map paths such as `pkg/client#Export` (Payload docs, plugin template v3.92).
 - GTM's `gtm.js?id=GTM-XXXX` is public and contains the published container as JSON (`resource.macros`, `resource.tags`, `resource.predicates`, `resource.rules`).
 - GTM itself wraps `dataLayer.push`. Every push, whoever made it, lands in the `dataLayer` array.
-- `gtag()` pushes an `arguments` object (`['event', name, params]`) onto the same array.
+- `gtag()` pushes an `arguments` object (`['event', name, params]`) onto the same array. gtag.js and GTM ignore real arrays and only process `arguments` objects.
+- gtag.js (GA4) and gtm.js can share one dataLayer. GA4 sets first-party `_ga*` cookies as soon as `config` runs unless Consent Mode says otherwise.
+- Consent Mode `gtag('consent','default',…)` must be in the dataLayer before any Google tag processes the queue. Since March 2024 Google requires Consent Mode v2 (`ad_user_data`, `ad_personalization`) for EEA traffic.
 
 ### Assumptions
 
@@ -38,13 +40,14 @@ The recommended shape is a **single Payload plugin running inside the host Paylo
 
 - Q-01: Should the plugin also *write* to GTM (create triggers/tags) through the GTM API v2? This needs OAuth/service-account management. Deferred to v0.3. Owner: maintainer.
 - Q-02: Is server-side GTM (sGTM) container parsing needed? Its format differs. Deferred until requested.
-- Q-03: Should discovery respect a consent signal by default? It currently ships an opt-in `shouldCapture` hook. Owner: integrator per jurisdiction.
+- Q-03 (resolved in 0.3.0): Google tags now get Consent Mode v2 defaults from the settings global (off by default; fail-closed when on). Discovery beacons carry no identifiers or cookies and stay governed by the opt-in `shouldCapture` hook. Whether discovery should also follow `analytics_storage` stays with the integrator per jurisdiction.
+- Q-04: Do integrators need GA4 Measurement Protocol (server-side events) or `ads_data_redaction` / `url_passthrough`? Deferred until requested. Owner: maintainer.
 
 ## 3. Goals and Non-Goals
 
 ### Goals
 
-- Install GTM on a site with one component/function call configured from the Payload admin.
+- Install GTM and/or GA4 on a site with one component/function call configured from the Payload admin, with Consent Mode v2 defaults sent before any tag loads.
 - Discover ≥ 95% of the distinct custom events a site emits within one day of normal traffic, when runtime capture is enabled.
 - Discover container-defined events without any traffic, through the container scan.
 - Give marketers an editable registry: status (discovered/approved/deprecated/ignored), descriptions, owners, and parameter docs.
@@ -55,7 +58,8 @@ The recommended shape is a **single Payload plugin running inside the host Paylo
 - Replacing GA4/GTM reporting or counting events precisely.
 - Storing raw visitor events, user identifiers, or cookies.
 - Managing GTM workspaces or versions (Q-01).
-- Consent-management UI (CMPs remain the site's responsibility).
+- Consent-management UI (CMPs/banners remain the site's responsibility; the plugin only sends defaults and exposes `updateConsent()`).
+- GA4 reporting, the GA4 Admin/Data APIs, and Measurement Protocol (Q-04).
 
 ## 4. Users, Roles, and Critical Journeys
 
@@ -65,7 +69,8 @@ The recommended shape is a **single Payload plugin running inside the host Paylo
 - **Payload editor/marketer (authenticated):** reviews and annotates events, triggers scans.
 - **Payload admin (authenticated, privileged):** configures container ID, discovery, and access.
 - **Developer/integrator (trusted, code-level):** installs the plugin and frontend snippet and sets plugin options.
-- **Google Tag Manager CDN (external):** serves `gtm.js`.
+- **Google Tag Manager CDN (external):** serves `gtm.js` and GA4 `gtag/js`.
+- **Consent banner / CMP (site-owned):** records the visitor's choice and calls `updateConsent()`.
 
 ### Critical journeys
 
@@ -87,6 +92,8 @@ The recommended shape is a **single Payload plugin running inside the host Paylo
 - **FR-08 (Should):** Provide an admin "Scan now" control and a JSON export.
 - **FR-09 (Should):** Provide a schedulable Payload job task for periodic scans.
 - **FR-10 (Must):** Provide an enable/disable option that keeps the schema stable.
+- **FR-12 (Must, 0.3.0):** Load GA4 via gtag.js from a measurement ID (admin or code default), alone or alongside GTM, on the shared dataLayer, with initial page view and DebugView toggles.
+- **FR-13 (Must, 0.3.0):** When enabled, push Consent Mode v2 defaults (four signals, optional regions, `wait_for_update`) before GTM/gtag load; provide `updateConsent()` and an SSR `consentScriptContent()`.
 - **FR-11 (Later):** Push approved events to GTM as triggers via the GTM API (Q-01).
 
 ## 6. Non-Functional Requirements
@@ -97,6 +104,7 @@ The recommended shape is a **single Payload plugin running inside the host Paylo
 - **NFR-04:** A container scan completes in < 10 s (one fetch, 10 s timeout). A crawl of ≤ 25 pages completes in < 60 s.
 - **SEC-01:** The collect endpoint enforces a body-size cap (32 KB), a batch cap (50 events), name/path allow-lists, a per-IP token bucket, an origin allow-list, and a total registry cap.
 - **SEC-02:** By default no parameter values are stored. When enabled, examples are redacted (emails, phone/long digit runs, tokens) and truncated to 100 chars.
+- **SEC-04:** Every value interpolated into an inline snippet (tag IDs, dataLayer name, environment tokens, CSP nonce, consent signals/regions/wait) is allow-list validated in the browser runtime, and tag IDs are re-validated on the server before they are served. The CSP nonce is propagated to the dynamically loaded gtm.js/gtag.js script.
 - **SEC-03:** Server fetches go only to `www.googletagmanager.com` or to the configured site origin. Redirects stay same-origin, and every fetch has a timeout and a byte cap.
 - **OPS-01:** All plugin logs go through `payload.logger` with a `gtm` prefix and contain no parameter values.
 
@@ -362,6 +370,7 @@ sequenceDiagram
 #### `gtm-settings` (global)
 
 - Fields: `enabled`, `containerId` (`^GTM-[A-Z0-9]{4,12}$`), `environment.auth`, `environment.preview`, `dataLayerName`, `discovery.enabled`, `discovery.sampleRate` (0–1), `discovery.captureExamples`, `discovery.includeBuiltInEvents`, `discovery.allowedOrigins[]`, `crawl.siteUrl`, `crawl.maxPages`, `crawl.useSitemap`, `lastScan` (read-only JSON summary including Data Layer Variables).
+- Added in 0.3.0: `analytics.measurementId` (`^G-[A-Z0-9]{4,15}$`, trimmed/uppercased on save), `analytics.sendPageView`, `analytics.debugMode`, `consent.enabled`, `consent.analyticsStorage|adStorage|adUserData|adPersonalization` (`denied`/`granted`, default `denied`), `consent.waitForUpdateMs` (0–10000, default 500), `consent.regions[]` (ISO 3166). Requires a migration on SQL adapters.
 - Plugin options provide defaults; the global overrides them at runtime.
 
 ### Entity relationships
@@ -440,7 +449,7 @@ Not applicable — no uploads.
 ## 17. Authentication, Authorization, and Privacy
 
 - Authentication and session lifecycle: delegated to Payload auth (host users collection).
-- Roles/attributes and authorization rules: `access` plugin option overrides read/update/delete/scan. Defaults: authenticated users may read/update/scan; delete is allowed for authenticated users; create happens only through the Local API (`overrideAccess`) after endpoint validation, and `access.create` returns false for REST.
+- Roles/attributes and authorization rules: `access` plugin option overrides read/update/delete/scan. Defaults (since 0.3.0): only logged-in users of the admin user collection (`config.admin.user`) may read/update/delete/scan; users of other auth collections are refused, and a boot warning fires when the admin collection has a role field and no override is set; create happens only through the Local API (`overrideAccess`) after endpoint validation, and `access.create` returns false for REST.
 - Tenant isolation: not applicable by default; documented hook via `overrideCollection`.
 - Administrative/support controls: settings global update requires authentication; the scan is rate limited by a single-flight lock.
 - Data classification and minimization: event names and key paths are internal metadata. Example values are personal-data candidates, off by default and redacted. Page paths have query strings and fragments stripped.
@@ -453,7 +462,8 @@ Not applicable — no uploads.
 ### Trust boundaries and entry points
 
 - Browser → `POST /api/gtm/collect` (public, untrusted input).
-- Browser → `GET /api/gtm/config` (public read).
+- Browser → `GET /api/gtm/config` (public read; returns tag IDs and consent defaults, all public by nature).
+- Page → googletagmanager.com / google-analytics.com (third-party tags under the site's CSP and Consent Mode).
 - Admin → `POST /api/gtm/scan` (authenticated; triggers outbound fetches).
 - Server → googletagmanager.com and the site origin (untrusted response bodies).
 
@@ -466,6 +476,10 @@ Not applicable — no uploads.
 - **T-05 Malicious container response** (prototype pollution, huge JSON). Controls: host pinned to `www.googletagmanager.com`, 5 MB cap, `JSON.parse` only (no eval), keys read defensively. Verification: parser tests with malformed input.
 - **T-06 Stored XSS through event names in the admin UI.** Controls: name regex, and React escaping in the admin. Verification: test that a `<script>` name is rejected.
 - **T-07 Unauthorized registry writes through REST.** Controls: `access.create` false for REST; update restricted by access. Verification: integration test that an anonymous REST create is rejected.
+- **T-08 Tracking before consent** (GA4 cookies set before the visitor decides). Likelihood high for EEA sites without Consent Mode; impact regulatory. Controls: consent defaults pushed before any tag in `initGtm` and `consentScriptContent()`; stored signals fail closed (anything but `granted` → `denied`); once per page. Residual: off by default for backward compatibility, so the integrator must enable it; a CMP that sets its own defaults must pass `consentDefaults: false`. Verification: browser test that the default is dataLayer entry 0 and is a real `arguments` object.
+- **T-10 Tag hijack through settings access** (a non-admin user swaps `containerId`/`measurementId` and runs arbitrary JS on every page). Likelihood high on sites with customer sign-up before 0.3.0; impact critical. Controls: default access limited to the admin user collection; boot warning for multi-role admin collections; documented `access` overrides. Verification: integration test that a `customers` user cannot update the global, read the registry, scan or export.
+- **T-11 Memory exhaustion on collect** (chunked body without Content-Length). Controls: the body stream is read with a 32 KB cap and cancelled on overflow. Verification: integration test with a 1.6 MB chunked stream that stops after a few chunks.
+- **T-09 Script injection through snippet values** (tag ID, nonce, region written into inline JS). Controls: SEC-04 allow-lists, server re-validation of stored IDs, boot-time failure on bad code defaults. Verification: unit tests with injection payloads for every interpolated value.
 
 ### Abuse controls
 
@@ -586,7 +600,10 @@ Not applicable — no uploads.
 - **R-01:** GTM changes the gtm.js format. Probability medium; impact: the scan breaks. Mitigation: defensive parser with fixture tests; the scan error is surfaced in the admin. Contingency: GTM API source (Q-01). Trigger: the scan finds 0 events on a non-empty container.
 - **R-02:** Adblockers block the beacon path. Probability medium; impact: coverage drops. Mitigation: first-party endpoint without "gtm/analytics" in the path is configurable (`collectPath`). Contingency: container scan plus crawl.
 - **R-03:** Sites with dynamic event names (`click_${id}`) explode the registry. Probability medium. Mitigation: `maxEvents` cap and ignore rules; a warning in the admin when the count approaches the cap.
-- **R-04:** Privacy complaint about discovery traffic. Probability low. Mitigation: no values or identifiers by default, a `shouldCapture` consent hook, and documentation.
+- **R-04:** Privacy complaint about discovery traffic or GA4 cookies. Probability low (discovery) / medium (GA4 without consent). Mitigation: no values or identifiers in discovery, a `shouldCapture` hook, Consent Mode v2 defaults (T-08), and documentation.
+- **R-06:** Changing `basePath`/`routes.api` without telling the frontend silently disables all tags. Mitigation: `basePath`/`apiRoute` options in `initGtm` and the React component; README troubleshooting.
+- **R-07:** Inline crawl exceeds serverless request limits. Mitigation: documented job-based scans and crawl limits. Trigger: 504s on `POST /scan` with `crawl: true`.
+- **R-05:** GA4 double counting when the GTM container also fires a GA4 tag for the same measurement ID. Probability medium. Mitigation: admin field description and README warning. Trigger: page views roughly doubled after enabling the measurement ID.
 
 ## 27. Architecture Decision Records
 
@@ -623,6 +640,23 @@ Not applicable — no uploads.
 - Consequences: limits are per instance; documented, with a Redis adapter as a phase 2 lever.
 - Amended in 0.2.0: correctness no longer depends on a single instance. Registry merges and scans hold database leases (unique-key rows in a hidden locks collection, which every adapter enforces atomically, with expiry for crashed holders); new-name creation is capped per rolling hour by a database count; no-op observations are batched in memory and written at most once per `writeIntervalMs`. The rate limiter is pluggable (`discovery.rateLimiter`) for a shared store; the built-in limiter, dedupe window and settings cache remain per instance by design.
 
+### ADR-005 — Load GA4 directly with gtag.js on the shared dataLayer
+
+- Status: Accepted (0.3.0)
+- Context: many Payload sites want GA4 without running a GTM container.
+- Options: (A) require GTM and a GA4 tag in the container; (B) load gtag.js directly on the same dataLayer; (C) server-side Measurement Protocol only.
+- Decision: B, alongside or instead of GTM. A is still supported; C does not capture browser behavior and needs an API secret (Q-04).
+- Consequences: discovery sees `gtag('event')` calls for free; GA4-only sites have no container to scan (runtime and crawl still work); risk of double counting when A and B are both used for one ID (R-05). `pushEvent()` objects are GTM-only, so a separate `gtagEvent()` helper is provided.
+
+### ADR-006 — Consent Mode defaults owned by the settings global, off by default, fail closed
+
+- Status: Accepted (0.3.0)
+- Context: GA4 sets cookies on load; EEA traffic needs Consent Mode v2; sites already using a CMP may set defaults themselves.
+- Options: (A) leave consent entirely to the site; (B) on by default with all signals denied; (C) admin-controlled, off by default, denied defaults when enabled, opt-out per page via `consentDefaults: false`.
+- Decision: C. B would silently stop measurement for every existing install on upgrade; A was the 0.2.0 gap.
+- Consequences: integrators must turn it on; stored values fail closed; defaults are pushed once per page before any tag; `updateConsent()` covers the banner callback.
+- Revisit trigger: Google makes Consent Mode mandatory outside the EEA, or most installs enable it → default to on in a major release.
+
 ## 28. MVP Definition of Done
 
 - [ ] Critical journeys 1–5 are covered by integration tests or manual verification in the dev app.
@@ -645,6 +679,9 @@ Not applicable — no uploads.
 - Payload plugin template: https://github.com/payloadcms/payload/tree/main/templates/plugin
 - GTM install snippet: https://developers.google.com/tag-platform/tag-manager/web
 - GTM data layer: https://developers.google.com/tag-platform/tag-manager/datalayer
+- GA4 gtag.js setup: https://developers.google.com/tag-platform/gtagjs/install
+- Consent Mode v2: https://developers.google.com/tag-platform/security/guides/consent
+- CSP with Google tags: https://developers.google.com/tag-platform/security/guides/csp
 - OWASP ASVS 4.0 (input validation, SSRF): https://owasp.org/www-project-application-security-verification-standard/
 
 ## 31. High-Scale Commerce and Concurrency

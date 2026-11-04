@@ -2,10 +2,9 @@ import type { CollectionConfig } from 'payload'
 
 import type { ResolvedGtmPluginOptions } from '../types.js'
 
+import { isAdminUser } from '../lib/access.js'
 import { invalidateIgnoreCache } from '../lib/publicConfig.js'
 import { EVENT_NAME_RE } from '../shared/normalize.js'
-
-const isAuthenticated = ({ req }: { req: { user?: unknown } }) => Boolean(req.user)
 
 /** Fields written by discovery; read-only in the admin (INV-02). */
 const discoveryOwned = { readOnly: true } as const
@@ -16,9 +15,9 @@ export const buildGtmEventsCollection = (options: ResolvedGtmPluginOptions): Col
     access: {
       // Events are only created by discovery (Local API with overrideAccess) — never via REST.
       create: () => false,
-      delete: options.access.delete ?? isAuthenticated,
-      read: options.access.read ?? isAuthenticated,
-      update: options.access.update ?? isAuthenticated,
+      delete: options.access.delete ?? isAdminUser,
+      read: options.access.read ?? isAdminUser,
+      update: options.access.update ?? isAdminUser,
     },
     admin: {
       components: options.disabled

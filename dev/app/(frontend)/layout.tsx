@@ -7,7 +7,7 @@ export default function FrontendLayout({ children }: { children: React.ReactNode
   return (
     <html lang="en">
       <body style={{ fontFamily: 'system-ui', margin: 40 }}>
-        {/* Fetches /api/gtm/config, loads GTM and starts dataLayer discovery */}
+        {/* Fetches /api/gtm/config, loads GTM and/or GA4 and starts dataLayer discovery */}
         <GoogleTagManager />
         {children}
       </body>

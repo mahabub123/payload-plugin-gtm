@@ -10,10 +10,20 @@ import { buildGtmSettingsGlobal } from './globals/gtmSettings.js'
 import { buildPublicConfig } from './lib/publicConfig.js'
 import { runScan, ScanInProgressError } from './lib/scan.js'
 import { getSettings } from './lib/settings.js'
+import { CONTAINER_ID_RE, MEASUREMENT_ID_RE, normalizeTagId } from './shared/ids.js'
 
 export type { PublicGtmConfig } from './browser/index.js'
 export { expandSimpleRegex, parseContainer } from './lib/containerParser.js'
 export { extractEventNames } from './lib/crawler.js'
+
+/** Fail fast at boot on a mistyped code default instead of silently loading nothing. */
+const checkTagId = (name: string, value: string | undefined, re: RegExp, example: string) => {
+  const id = normalizeTagId(value)
+  if (id && !re.test(id)) {
+    throw new Error(`[payload-plugin-gtm] invalid ${name} "${value}" (expected e.g. ${example})`)
+  }
+  return id
+}
 
 export const resolveOptions = (options: GtmPluginOptions = {}): ResolvedGtmPluginOptions => ({
   access: options.access ?? {},
@@ -21,7 +31,7 @@ export const resolveOptions = (options: GtmPluginOptions = {}): ResolvedGtmPlugi
   basePath: options.basePath ?? 'gtm',
   cacheSeconds: options.cacheSeconds ?? 30,
   collectionSlug: options.collectionSlug ?? 'gtm-events',
-  containerId: options.containerId,
+  containerId: checkTagId('containerId', options.containerId, CONTAINER_ID_RE, 'GTM-ABC1234'),
   crawl: {
     maxPages: options.crawl?.maxPages ?? 25,
     maxScripts: options.crawl?.maxScripts ?? 30,
@@ -39,20 +49,48 @@ export const resolveOptions = (options: GtmPluginOptions = {}): ResolvedGtmPlugi
   },
   globalSlug: options.globalSlug ?? 'gtm-settings',
   lockSlug: `${options.collectionSlug ?? 'gtm-events'}-locks`,
+  measurementId: checkTagId(
+    'measurementId',
+    options.measurementId,
+    MEASUREMENT_ID_RE,
+    'G-ABC123XYZ9',
+  ),
   overrideCollection: options.overrideCollection,
   overrideGlobal: options.overrideGlobal,
   scanQueue: options.scanQueue ?? 'default',
   scanSchedule: options.scanSchedule,
 })
 
+/**
+ * The default access trusts every user of the admin collection. Warn once at boot when
+ * that collection looks multi-role and no explicit settings access was configured.
+ */
+const warnOnSharedAdminCollection = (payload: Payload, pluginOptions: GtmPluginOptions) => {
+  if (pluginOptions.access?.updateSettings || pluginOptions.access?.update) {
+    return
+  }
+  const adminSlug = payload.config.admin?.user
+  const adminCollection = payload.config.collections.find((c) => c.slug === adminSlug)
+  const hasRoles = adminCollection?.flattenedFields?.some((f) =>
+    ['role', 'roles'].includes((f as { name?: string }).name ?? ''),
+  )
+  if (hasRoles) {
+    payload.logger.warn(
+      `[gtm] every "${adminSlug}" user can change the GTM/GA4 settings (and so load scripts on your site). ` +
+        `That collection has a role field: set access.updateSettings / access.update / access.scan to restrict it to admins.`,
+    )
+  }
+}
+
 /** Remembered per Payload config so `getGtmSettings` can resolve slugs/defaults. */
 const OPTIONS_KEY = 'payload-plugin-gtm'
 
 /**
- * Payload CMS plugin: Google Tag Manager + automatic dataLayer event discovery.
+ * Payload CMS plugin: Google Tag Manager and/or Google Analytics 4 + automatic dataLayer
+ * event discovery.
  *
  * @example
- * plugins: [gtmPlugin({ containerId: 'GTM-ABC1234' })]
+ * plugins: [gtmPlugin({ containerId: 'GTM-ABC1234', measurementId: 'G-ABC123XYZ9' })]
  */
 export const gtmPlugin =
   (pluginOptions: GtmPluginOptions = {}) =>
@@ -121,10 +159,11 @@ export const gtmPlugin =
       if (incomingOnInit) {
         await incomingOnInit(payload)
       }
+      warnOnSharedAdminCollection(payload, pluginOptions)
       const settings = await getSettings(payload, options).catch(() => null)
-      if (settings && !settings.containerId) {
+      if (settings && !settings.containerId && !settings.analytics.measurementId) {
         payload.logger.info(
-          `[gtm] no container ID yet — set one in the "${options.globalSlug}" global or the plugin options`,
+          `[gtm] no GTM container or GA4 measurement ID yet — set one in the "${options.globalSlug}" global or the plugin options`,
         )
       }
     }
