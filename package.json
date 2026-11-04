@@ -1,6 +1,6 @@
 {
   "name": "payload-plugin-gtm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Google Tag Manager for Payload CMS v3 with automatic dataLayer event discovery (runtime capture, container scan, page crawl) and an editable event registry.",
   "keywords": [
     "payload",
