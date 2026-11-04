@@ -2,6 +2,11 @@ import type { Access, CollectionConfig, GlobalConfig, PayloadRequest } from 'pay
 
 export type GtmAccessFn = (args: { req: PayloadRequest }) => boolean | Promise<boolean>
 
+/** Pluggable rate limiter for `POST /api/gtm/collect`. */
+export type GtmRateLimiter = {
+  take: (key: string, req: PayloadRequest) => boolean | Promise<boolean>
+}
+
 export type GtmPluginOptions = {
   /**
    * Access control overrides. Defaults: any authenticated user can read, update,
@@ -67,10 +72,37 @@ export type GtmPluginOptions = {
   discovery?: {
     /** Server-side window in ms during which identical signatures skip DB writes. @default 60000 */
     dedupeWindowMs?: number
+    /**
+     * How the collect endpoint identifies a client for rate limiting. The default uses
+     * `cf-connecting-ip`, then `x-real-ip`, then the LAST `x-forwarded-for` entry (the one
+     * your own proxy added — the first entry is client-controlled and easy to spoof).
+     * Override if your proxy setup differs.
+     */
+    getClientIp?: (req: PayloadRequest) => string
     /** Hard cap on distinct events in the registry. @default 500 */
     maxEvents?: number
-    /** Requests per minute per client IP to the collect endpoint (per instance). @default 30 */
+    /**
+     * Cap on NEW event names that runtime/crawl discovery may create per rolling hour,
+     * counted in the database (so it holds across all instances). Container scans are
+     * exempt. Limits how fast junk posted to the public endpoint can fill the registry.
+     * @default 100
+     */
+    maxNewEventsPerHour?: number
+    /**
+     * Shared rate limiter for the collect endpoint. The built-in limiter is in-memory, so
+     * on serverless or multi-instance deployments each instance counts separately; plug
+     * in a shared store (Redis, Upstash, ...) here to enforce one limit everywhere.
+     * Return `true` to allow the request.
+     */
+    rateLimiter?: GtmRateLimiter
+    /** Requests per minute per client IP for the built-in limiter. @default 30 */
     rateLimitPerMinute?: number
+    /**
+     * Observations that add nothing new to an event are counted in memory and written at
+     * most once per this interval (ms) per event, instead of on every page view.
+     * @default 300000 (5 minutes)
+     */
+    writeIntervalMs?: number
   }
 
   /** Slug of the settings global. @default 'gtm-settings' */
@@ -102,8 +134,18 @@ export type ResolvedGtmPluginOptions = {
   containerId?: string
   crawl: Required<NonNullable<GtmPluginOptions['crawl']>>
   disabled: boolean
-  discovery: Required<NonNullable<GtmPluginOptions['discovery']>>
+  discovery: {
+    dedupeWindowMs: number
+    getClientIp?: (req: PayloadRequest) => string
+    maxEvents: number
+    maxNewEventsPerHour: number
+    rateLimiter?: GtmRateLimiter
+    rateLimitPerMinute: number
+    writeIntervalMs: number
+  }
   globalSlug: string
+  /** Internal lease collection, `${collectionSlug}-locks`. */
+  lockSlug: string
   overrideCollection?: GtmPluginOptions['overrideCollection']
   overrideGlobal?: GtmPluginOptions['overrideGlobal']
   scanQueue: string

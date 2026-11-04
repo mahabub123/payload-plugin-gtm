@@ -7,7 +7,8 @@ import type { Observation } from './registry.js'
 import { BUILT_IN_EVENT_RE } from '../shared/normalize.js'
 import { parseContainer } from './containerParser.js'
 import { crawlSite, safeFetchText } from './crawler.js'
-import { upsertObservations } from './registry.js'
+import { tryAcquireLock } from './locks.js'
+import { upsertObservations, upsertOptionsFrom } from './registry.js'
 import { getSettings, invalidateSettingsCache } from './settings.js'
 
 export const GTM_ORIGIN = 'https://www.googletagmanager.com'
@@ -26,11 +27,11 @@ export const buildContainerUrl = (
   return url.toString()
 }
 
-let running: null | Promise<ScanSummary> = null
+let running = false
 
 export class ScanInProgressError extends Error {
   constructor() {
-    super('A scan is already running on this instance')
+    super('A scan is already running')
   }
 }
 
@@ -40,11 +41,16 @@ export type ScanArgs = {
   fetchImpl?: FetchLike
 }
 
+/** Longest a scan can legitimately take (every fetch timing out) plus a margin. */
+const scanLeaseMs = (options: ResolvedGtmPluginOptions) =>
+  (options.crawl.maxPages + options.crawl.maxScripts + 3) * options.crawl.timeoutMs + 60_000
+
 /**
  * Runs a container scan and/or a crawl, upserts results and stores a summary on
- * the settings global. Single-flight per instance.
+ * the settings global. Single-flight across ALL instances via a database lease;
+ * throws ScanInProgressError if another scan holds it.
  */
-export const runScan = (
+export const runScan = async (
   payload: Payload,
   options: ResolvedGtmPluginOptions,
   args: ScanArgs = {},
@@ -52,10 +58,20 @@ export const runScan = (
   if (running) {
     throw new ScanInProgressError()
   }
-  running = doScan(payload, options, args).finally(() => {
-    running = null
-  })
-  return running
+  running = true
+  try {
+    const release = await tryAcquireLock(payload, options.lockSlug, 'scan', scanLeaseMs(options))
+    if (!release) {
+      throw new ScanInProgressError()
+    }
+    try {
+      return await doScan(payload, options, args)
+    } finally {
+      await release()
+    }
+  } finally {
+    running = false
+  }
 }
 
 const doScan = async (
@@ -67,10 +83,7 @@ const doScan = async (
   const settings = await getSettings(payload, options)
   const summary: ScanSummary = { at: new Date().toISOString(), errors: [] }
   const includeBuiltIn = settings.discovery.includeBuiltInEvents
-  const upsertOpts = {
-    collectionSlug: options.collectionSlug,
-    maxEvents: options.discovery.maxEvents,
-  }
+  const upsertOpts = upsertOptionsFrom(options)
 
   if (container) {
     if (!settings.containerId) {

@@ -4,10 +4,11 @@ import type { PublicGtmConfig } from './browser/index.js'
 import type { GtmPluginOptions, GtmRuntimeSettings, ResolvedGtmPluginOptions } from './types.js'
 
 import { buildGtmEventsCollection } from './collections/gtmEvents.js'
+import { buildGtmLocksCollection } from './collections/gtmLocks.js'
 import { buildEndpoints } from './endpoints/index.js'
 import { buildGtmSettingsGlobal } from './globals/gtmSettings.js'
 import { buildPublicConfig } from './lib/publicConfig.js'
-import { runScan } from './lib/scan.js'
+import { runScan, ScanInProgressError } from './lib/scan.js'
 import { getSettings } from './lib/settings.js'
 
 export type { PublicGtmConfig } from './browser/index.js'
@@ -29,10 +30,15 @@ export const resolveOptions = (options: GtmPluginOptions = {}): ResolvedGtmPlugi
   disabled: options.disabled ?? false,
   discovery: {
     dedupeWindowMs: options.discovery?.dedupeWindowMs ?? 60_000,
+    getClientIp: options.discovery?.getClientIp,
     maxEvents: options.discovery?.maxEvents ?? 500,
+    maxNewEventsPerHour: options.discovery?.maxNewEventsPerHour ?? 100,
+    rateLimiter: options.discovery?.rateLimiter,
     rateLimitPerMinute: options.discovery?.rateLimitPerMinute ?? 30,
+    writeIntervalMs: options.discovery?.writeIntervalMs ?? 5 * 60_000,
   },
   globalSlug: options.globalSlug ?? 'gtm-settings',
+  lockSlug: `${options.collectionSlug ?? 'gtm-events'}-locks`,
   overrideCollection: options.overrideCollection,
   overrideGlobal: options.overrideGlobal,
   scanQueue: options.scanQueue ?? 'default',
@@ -55,7 +61,11 @@ export const gtmPlugin =
     const config: Config = { ...incomingConfig }
 
     // Schema is always registered, even when disabled, so migrations stay stable.
-    config.collections = [...(config.collections ?? []), buildGtmEventsCollection(options)]
+    config.collections = [
+      ...(config.collections ?? []),
+      buildGtmEventsCollection(options),
+      buildGtmLocksCollection(options.lockSlug),
+    ]
     config.globals = [...(config.globals ?? []), buildGtmSettingsGlobal(options)]
     config.custom = { ...(config.custom ?? {}), [OPTIONS_KEY]: options }
 
@@ -68,10 +78,20 @@ export const gtmPlugin =
     const scanTask: TaskConfig = {
       slug: 'gtmScan',
       handler: async ({ input, req }) => {
-        const summary = await runScan(req.payload, options, {
-          container: true,
-          crawl: Boolean((input as { crawl?: boolean } | undefined)?.crawl),
-        })
+        let summary
+        try {
+          summary = await runScan(req.payload, options, {
+            container: true,
+            crawl: Boolean((input as { crawl?: boolean } | undefined)?.crawl),
+          })
+        } catch (err) {
+          if (err instanceof ScanInProgressError) {
+            // Another instance is already scanning: nothing to do, don't burn retries.
+            req.payload.logger.info('[gtm] scheduled scan skipped: a scan is already running')
+            return { output: { errors: 0, events: 0 } }
+          }
+          throw err
+        }
         return {
           output: {
             errors: summary.errors.length,
@@ -132,6 +152,7 @@ export const getGtmPublicConfig = (payload: Payload): Promise<PublicGtmConfig> =
 
 export type {
   GtmPluginOptions,
+  GtmRateLimiter,
   GtmRuntimeSettings,
   ResolvedGtmPluginOptions,
   ScanSummary,

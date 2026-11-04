@@ -4,8 +4,11 @@ import config from '@payload-config'
 import { createPayloadRequest, getPayload } from 'payload'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 
+import { buildEndpoints } from '../src/endpoints/index.js'
 import { resolveOptions } from '../src/index.js'
-import { runScan } from '../src/lib/scan.js'
+import { tryAcquireLock } from '../src/lib/locks.js'
+import { upsertObservations, upsertOptionsFrom } from '../src/lib/registry.js'
+import { runScan, ScanInProgressError } from '../src/lib/scan.js'
 import { invalidateSettingsCache } from '../src/lib/settings.js'
 import { GTM_JS_FIXTURE } from '../test/fixtures/gtmContainer.js'
 
@@ -341,5 +344,145 @@ describe('scan', () => {
     expect(names).toEqual([...names].sort())
     expect(names).toEqual(expect.arrayContaining(['add_to_cart', 'purchase', 'plan_selected']))
     expect(body.events[0].parameters.every((p: any) => !('id' in p))).toBe(true)
+  })
+})
+
+describe('multi-instance safety', () => {
+  const options = resolveOptions()
+
+  test('database lease: second holder is refused, release frees it, stale lease is taken over', async () => {
+    const release = await tryAcquireLock(payload, options.lockSlug, 'test-key', 60_000)
+    expect(release).not.toBeNull()
+    expect(await tryAcquireLock(payload, options.lockSlug, 'test-key', 60_000)).toBeNull()
+    await release!()
+    const again = await tryAcquireLock(payload, options.lockSlug, 'test-key', 60_000)
+    expect(again).not.toBeNull()
+    await again!()
+
+    // A crashed holder (expired lease) does not block forever.
+    await tryAcquireLock(payload, options.lockSlug, 'stale-key', -1_000)
+    const takeover = await tryAcquireLock(payload, options.lockSlug, 'stale-key', 60_000)
+    expect(takeover).not.toBeNull()
+    await takeover!()
+  })
+
+  test('a scan holding the lease on another instance blocks this one', async () => {
+    const release = await tryAcquireLock(payload, options.lockSlug, 'scan', 60_000)
+    await expect(
+      runScan(payload, options, {
+        container: true,
+        fetchImpl: () => Promise.resolve(new Response('', { status: 404 })),
+      }),
+    ).rejects.toBeInstanceOf(ScanInProgressError)
+    await release!()
+    const summary = await runScan(payload, options, {
+      container: true,
+      fetchImpl: () => Promise.resolve(new Response('', { status: 404 })),
+    })
+    expect(summary.errors[0]).toMatch(/not found/)
+  })
+
+  test('concurrent merges into one event lose no parameters or pages', async () => {
+    const opts = upsertOptionsFrom(options)
+    await upsertObservations(payload, opts, [{ name: 'race_event', params: [], source: 'runtime' }])
+    await Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        upsertObservations(payload, opts, [
+          {
+            name: 'race_event',
+            page: `/p${i}`,
+            params: [{ path: `param_${i}`, type: 'string' }],
+            source: 'runtime',
+          },
+        ]),
+      ),
+    )
+    const doc = await findEvent('race_event')
+    expect(doc!.parameters.map((p: any) => p.path).sort()).toEqual(
+      Array.from({ length: 12 }, (_, i) => `param_${i}`).sort(),
+    )
+    expect(doc!.pages).toHaveLength(12)
+    expect(doc!.occurrences).toBe(13)
+    const locks = await payload.count({
+      collection: options.lockSlug as never,
+      overrideAccess: true,
+    })
+    expect(locks.totalDocs).toBe(0) // every lease released
+  })
+
+  test('observations that add nothing new are counted without a write, then flushed', async () => {
+    const opts = upsertOptionsFrom(options)
+    const obs = {
+      name: 'quiet_event',
+      params: [{ path: 'a', type: 'string' as const }],
+      source: 'runtime' as const,
+    }
+    await upsertObservations(payload, opts, [obs])
+    const first = await findEvent('quiet_event')
+    await upsertObservations(payload, opts, [obs])
+    await upsertObservations(payload, opts, [obs])
+    const unchanged = await findEvent('quiet_event')
+    expect(unchanged!.updatedAt).toBe(first!.updatedAt)
+    expect(unchanged!.occurrences).toBe(1)
+
+    // Something new arrives: written at once, including the two pending sightings.
+    await upsertObservations(payload, opts, [{ ...obs, params: [{ path: 'b', type: 'number' }] }])
+    expect((await findEvent('quiet_event'))!.occurrences).toBe(4)
+  })
+
+  test('hourly cap on new names from runtime discovery, container exempt', async () => {
+    const created = await payload.count({
+      collection: 'gtm-events' as never,
+      overrideAccess: true,
+      where: { firstSeenAt: { greater_than: new Date(Date.now() - 3_600_000).toISOString() } },
+    })
+    const opts = { ...upsertOptionsFrom(options), maxNewEventsPerHour: created.totalDocs + 1 }
+    const res = await upsertObservations(payload, opts, [
+      { name: 'cap_a', params: [], source: 'runtime' },
+      { name: 'cap_b', params: [], source: 'runtime' },
+      { name: 'cap_c', params: [], source: 'container' },
+    ])
+    expect(res).toMatchObject({ created: 2, dropped: 1 })
+    expect(await findEvent('cap_b')).toBeUndefined()
+    expect(await findEvent('cap_c')).toBeDefined()
+  })
+
+  test('client IP uses the proxy-added x-forwarded-for entry, not the spoofable first one', async () => {
+    const statuses: number[] = []
+    for (let i = 0; i < 15; i++) {
+      const res = await request('post', '/gtm/collect', {
+        body: { events: [{ name: `spoof_${i}`, params: [] }], v: 1 },
+        headers: { 'x-forwarded-for': `1.2.3.${i}, 172.16.0.9` },
+      })
+      statuses.push(res.status)
+    }
+    expect(statuses).toContain(429)
+  })
+
+  test('a custom shared rate limiter replaces the in-memory one', async () => {
+    const keys: string[] = []
+    const custom = buildEndpoints(
+      resolveOptions({
+        discovery: {
+          getClientIp: () => 'visitor-1',
+          rateLimiter: {
+            take: (key) => {
+              keys.push(key)
+              return false
+            },
+          },
+        },
+      }),
+    ).find((e) => e.method === 'post' && e.path === '/gtm/collect')!
+    const req = (await createPayloadRequest({
+      config,
+      request: new Request('http://localhost:3000/api/gtm/collect', {
+        body: JSON.stringify({ events: [], v: 1 }),
+        method: 'POST',
+      }),
+    })) as PayloadRequest
+    const res = await custom.handler(req)
+    expect(res.status).toBe(429)
+    expect(keys).toEqual(['visitor-1'])
   })
 })

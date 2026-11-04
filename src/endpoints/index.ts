@@ -5,7 +5,7 @@ import type { ResolvedGtmPluginOptions } from '../types.js'
 
 import { buildPublicConfig } from '../lib/publicConfig.js'
 import { createRateLimiter, createTtlSet } from '../lib/rateLimit.js'
-import { upsertObservations } from '../lib/registry.js'
+import { upsertObservations, upsertOptionsFrom } from '../lib/registry.js'
 import { runScan, ScanInProgressError } from '../lib/scan.js'
 import { getSettings } from '../lib/settings.js'
 import { BUILT_IN_EVENT_RE, eventSignature, LIMITS, sanitizeBatch } from '../shared/normalize.js'
@@ -13,13 +13,23 @@ import { BUILT_IN_EVENT_RE, eventSignature, LIMITS, sanitizeBatch } from '../sha
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   Response.json(body, { headers, status })
 
-const clientIp = (req: PayloadRequest): string => {
+/**
+ * Default client key for rate limiting. The FIRST x-forwarded-for entry is whatever the
+ * client sent, so trusting it lets anyone dodge the limit with a fake header; the LAST
+ * entry is the address your own proxy saw.
+ */
+export const defaultClientIp = (req: PayloadRequest): string => {
   const h = req.headers
-  const forwarded = h?.get('x-forwarded-for')
-  if (forwarded) {
-    return forwarded.split(',')[0].trim()
+  const direct = h?.get('cf-connecting-ip') ?? h?.get('x-real-ip')
+  if (direct) {
+    return direct.trim()
   }
-  return h?.get('x-real-ip') ?? h?.get('cf-connecting-ip') ?? 'unknown'
+  const forwarded = h
+    ?.get('x-forwarded-for')
+    ?.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  return forwarded?.length ? forwarded[forwarded.length - 1] : 'unknown'
 }
 
 const serverOrigin = (req: PayloadRequest): null | string => {
@@ -64,6 +74,8 @@ export const buildEndpoints = (options: ResolvedGtmPluginOptions): Endpoint[] =>
     burst: Math.max(5, Math.ceil(options.discovery.rateLimitPerMinute / 3)),
     perMinute: options.discovery.rateLimitPerMinute,
   })
+  const clientIp = options.discovery.getClientIp ?? defaultClientIp
+  const rateLimiter = options.discovery.rateLimiter
   const recent = createTtlSet(options.discovery.dedupeWindowMs)
   const canScan = options.access.scan ?? (({ req }) => Boolean(req.user))
 
@@ -105,7 +117,16 @@ export const buildEndpoints = (options: ResolvedGtmPluginOptions): Endpoint[] =>
       return json({ error: 'Origin not allowed' }, 403)
     }
 
-    if (!limiter.take(clientIp(req))) {
+    let allowed: boolean
+    try {
+      const key = clientIp(req)
+      allowed = rateLimiter ? await rateLimiter.take(key, req) : limiter.take(key)
+    } catch (err) {
+      // A broken shared limiter must not open the endpoint up: fall back to in-memory.
+      req.payload.logger.warn(`[gtm] rate limiter failed: ${(err as Error).message}`)
+      allowed = limiter.take(clientIp(req))
+    }
+    if (!allowed) {
       return json({ error: 'Too many requests' }, 429, { ...cors, 'Retry-After': '60' })
     }
 
@@ -147,11 +168,7 @@ export const buildEndpoints = (options: ResolvedGtmPluginOptions): Endpoint[] =>
     }
 
     try {
-      const res = await upsertObservations(
-        req.payload,
-        { collectionSlug: options.collectionSlug, maxEvents: options.discovery.maxEvents },
-        observations,
-      )
+      const res = await upsertObservations(req.payload, upsertOptionsFrom(options), observations)
       return json(
         { accepted: res.created + res.updated, skipped: skipped + res.skipped + res.dropped },
         202,

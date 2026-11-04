@@ -127,8 +127,12 @@ gtmPlugin({
   access?: { read, update, delete, updateSettings, scan }
   discovery?: {
     maxEvents?: number             // 500: registry cap (protects against spam and dynamic names)
-    rateLimitPerMinute?: number    // 30 per IP, per instance
-    dedupeWindowMs?: number        // 60000: skip DB writes for identical observations
+    maxNewEventsPerHour?: number   // 100: new names from runtime/crawl per hour, across all instances
+    rateLimitPerMinute?: number    // 30 per IP for the built-in (in-memory) limiter
+    rateLimiter?: { take(key, req): boolean | Promise<boolean> } // shared limiter, e.g. Redis
+    getClientIp?: (req) => string  // how a client is identified for rate limiting
+    writeIntervalMs?: number       // 300000: max one write per event per interval when nothing is new
+    dedupeWindowMs?: number        // 60000: skip identical observations on this instance
   }
   crawl?: { maxPages?: 25, maxScripts?: 30, timeoutMs?: 10000 }
   scanSchedule?: string            // cron, e.g. '0 3 * * *'
@@ -150,7 +154,37 @@ gtmPlugin({
   - server-side re-validation and re-redaction of everything the browser sends
 - **REST `create` on the events collection is always denied.** Events are created only by discovery.
 - **Restricted outbound fetches.** Container scans only fetch from `https://www.googletagmanager.com`. The crawl only fetches the configured site's origin; redirects are re-checked, and every fetch has timeouts and byte caps.
-- **Per-instance limits.** Rate limits and dedupe are in memory per instance. Behind a load balancer, make sure `x-forwarded-for` is set by your proxy.
+- **Client IP.** The default uses `cf-connecting-ip`, then `x-real-ip`, then the *last* `x-forwarded-for` entry (the one your proxy added; the first is client-controlled). Override `discovery.getClientIp` if your setup differs.
+
+## Running on several instances or serverless
+
+The plugin's shared state lives in the database, so it is safe with any number of instances:
+
+- **Merges are locked per event.** Every registry update runs under a short database lease (a row with a unique key in the hidden `gtm-events-locks` collection), so two requests can't overwrite each other's parameters or pages. This works the same on Postgres, SQLite and MongoDB.
+- **One scan at a time, everywhere.** Scans take a `scan` lease, so a schedule plus a manual click (or two instances running the job) don't scan twice. Leases expire on their own if an instance crashes.
+- **New names are capped per hour in the database** (`maxNewEventsPerHour`), so junk posted to the public endpoint can't fill the registry quickly from any number of instances.
+- **Fewer writes.** Observations that add nothing new are counted in memory and written at most once per `writeIntervalMs` per event, so steady traffic mostly costs a single read.
+
+What stays per instance: the built-in rate limiter, the dedupe window and the settings cache (`cacheSeconds`). For one global rate limit, pass a shared limiter:
+
+```ts
+import { Ratelimit } from '@upstash/ratelimit'
+import { Redis } from '@upstash/redis'
+
+const ratelimit = new Ratelimit({ limiter: Ratelimit.slidingWindow(30, '1 m'), redis: Redis.fromEnv() })
+
+gtmPlugin({
+  discovery: {
+    rateLimiter: { take: async (ip) => (await ratelimit.limit(`gtm:${ip}`)).success },
+  },
+})
+```
+
+If the shared limiter throws, the plugin falls back to the in-memory one instead of opening the endpoint up.
+
+`occurrences` stays approximate: in-memory counts that haven't been written yet are lost if an instance stops. Use GA4 for real counts.
+
+**Upgrading from 0.1.x:** this version adds the `gtm-events-locks` collection and an index on `firstSeenAt`. On Postgres or SQLite with migrations, run `payload migrate:create` and `payload migrate` after upgrading.
 
 ## Troubleshooting
 

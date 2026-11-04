@@ -621,6 +621,7 @@ Not applicable — no uploads.
 - Context: plugin users expect zero infrastructure.
 - Decision: Payload collection/global plus root endpoints; in-memory rate limit and dedupe.
 - Consequences: limits are per instance; documented, with a Redis adapter as a phase 2 lever.
+- Amended in 0.2.0: correctness no longer depends on a single instance. Registry merges and scans hold database leases (unique-key rows in a hidden locks collection, which every adapter enforces atomically, with expiry for crashed holders); new-name creation is capped per rolling hour by a database count; no-op observations are batched in memory and written at most once per `writeIntervalMs`. The rate limiter is pluggable (`discovery.rateLimiter`) for a shared store; the built-in limiter, dedupe window and settings cache remain per instance by design.
 
 ## 28. MVP Definition of Done
 

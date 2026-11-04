@@ -185,6 +185,7 @@ export const buildGtmEventsCollection = (options: ResolvedGtmPluginOptions): Col
         name: 'firstSeenAt',
         type: 'date',
         admin: { ...discoveryOwned, date: { pickerAppearance: 'dayAndTime' }, position: 'sidebar' },
+        index: true,
       },
       {
         name: 'lastSeenAt',
